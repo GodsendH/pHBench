@@ -31,6 +31,8 @@ cd PRO-DREAM
 
 # Install requirements
 pip install -r requirements.txt
+
+
 ```
 
 ## Usage
@@ -44,6 +46,7 @@ python retrieval.py \
     --opt_train data/phopt_training.fasta \
     --opt_test data/phopt_testing.fasta \
     --opt_valid data/phopt_validation.fasta \
+    --model_name facebook/esm2_t33_650M_UR50D \
     --strategy opt_retrieval \
     --topk 5
 ```
