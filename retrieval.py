@@ -421,7 +421,7 @@ def main():
             args.batch_size, 
             opt_features_file, 
             args.strategy, 
-            args.lambda_param,
+            # args.lambda_param,
             dataset_type=dataset,
             train_features=train_features,
             train_records=train_records
