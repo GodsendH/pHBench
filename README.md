@@ -59,6 +59,8 @@ python retrieval.py \
 Train the model using Model-Agnostic Meta-Learning:
 
 ```bash
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+
 python maml.py \
     --mode train \
     --num_epochs 50 \
