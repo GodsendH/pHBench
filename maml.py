@@ -44,7 +44,10 @@ class MAMLTrainer(BaseTrainer):
             for spt_batch in support_loader:
                 spt_accs, spt_x, spt_y = spt_batch
                 spt_preds = learner(spt_accs, spt_x)
-                spt_loss = nn.MSELoss()(spt_preds.squeeze(), spt_y)
+                spt_loss = nn.MSELoss()(
+                    spt_preds.reshape(-1),
+                    spt_y.reshape(-1)
+                )
                 total_spt_loss += spt_loss
             learner.adapt(total_spt_loss/len(support_loader), allow_nograd=True)
 
@@ -59,7 +62,10 @@ class MAMLTrainer(BaseTrainer):
         y_qry = task_data['opt_pH'].unsqueeze(0).to(device)
         
         qry_preds = learner(accs_qry, x_qry)
-        qry_loss = nn.MSELoss()(qry_preds.squeeze(), y_qry)
+        qry_loss = nn.MSELoss()(
+            qry_preds.reshape(-1),
+            y_qry.reshape(-1)
+        )
         
         return qry_loss if train else (qry_loss.item(), qry_preds.item(), y_qry.item())
 
