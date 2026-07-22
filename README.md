@@ -65,7 +65,13 @@ python maml.py \
     --mode train \
     --num_epochs 50 \
     --retrieval_strategy opt_retrieval \
-    --topk 5
+    --topk 5 \
+    --pretrained \
+    --meta_lr 0.0001 \
+    --inner_lr 0.0005 \
+    --inner_steps 5 \
+    --validate_every 200 \
+    --patience 5
 ```
 
 #### Reptile Training
