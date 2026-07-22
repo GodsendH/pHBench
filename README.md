@@ -47,6 +47,7 @@ python retrieval.py \
     --opt_test data/phopt_testing.fasta \
     --opt_valid data/phopt_validation.fasta \
     --model_name facebook/esm2_t33_650M_UR50D \
+    --features_dir data/features \
     --strategy opt_retrieval \
     --topk 5
 ```

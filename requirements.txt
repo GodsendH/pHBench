@@ -12,3 +12,5 @@ tqdm==4.64.1
 transformers==4.40.0
 torchmetrics==0.11.4
 tensorboardX==2.6
+fair-esm==1.0.2
+gdown
