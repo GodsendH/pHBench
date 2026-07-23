@@ -10,7 +10,14 @@ import argparse
 from torch.utils.tensorboard import SummaryWriter
 
 from models import pHPredictionModel, ProteinpHDataset, SupportDataset
-from utils import BaseTrainer, calculate_metrics, print_metrics
+from utils import (
+    BaseTrainer,
+    calculate_metrics,
+    make_generator,
+    print_metrics,
+    seed_everything,
+    seed_worker,
+)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LOGGING_INTERVAL = 10
@@ -18,7 +25,7 @@ LOGGING_INTERVAL = 10
 class ReptileTrainer(BaseTrainer):
     def __init__(self, model, train_loader, valid_loader, test_loader, meta_lr,
                  inner_lr, num_epochs, writer, save_dir, patience=3, min_delta=0.001,
-                 validate_every=10, support_batch_size=1, inner_steps=5):
+                 validate_every=10, support_batch_size=1, inner_steps=5, seed=0):
         super().__init__(model, train_loader, valid_loader, test_loader,
                         writer, save_dir, patience, min_delta, validate_every)
         
@@ -28,35 +35,60 @@ class ReptileTrainer(BaseTrainer):
         self.num_epochs = num_epochs
         self.support_batch_size = support_batch_size
         self.inner_steps = inner_steps
+        self.support_generator = make_generator(seed)
         
-        self.inner_optimizer = torch.optim.SGD(self.model.parameters(), lr=self.inner_lr)
+        self.inner_optimizer = torch.optim.SGD(
+            self.model.get_trainable_params(),
+            lr=self.inner_lr,
+        )
+
+    def _snapshot_trainable_state(self):
+        return {
+            name: param.detach().clone()
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+        }
+
+    def _load_trainable_state(self, state):
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:
+                    param.copy_(state[name])
 
     def adapt_on_support_set(self, task_data):
         """执行内循环适应"""
         # 保存原始参数
-        original_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+        original_state = self._snapshot_trainable_state()
         
         # 一次性处理所有support set数据
         accs_spt, x_spt, y_spt = task_data['env_ids'], task_data['env_seqs'], task_data['env_pHs'].to(device)
         support_dataset = SupportDataset(accs_spt, x_spt, y_spt)
-        support_loader = DataLoader(support_dataset, batch_size=self.support_batch_size, shuffle=True)
+        support_loader = DataLoader(
+            support_dataset,
+            batch_size=self.support_batch_size,
+            shuffle=True,
+            generator=self.support_generator,
+        )
         
         for _ in range(self.inner_steps):
             total_spt_loss = 0.0
             for spt_batch in support_loader:
                 spt_accs, spt_x, spt_y = spt_batch
                 spt_preds = self.model(spt_accs, spt_x)
-                loss = nn.MSELoss()(spt_preds.squeeze(), spt_y)
+                loss = nn.MSELoss()(
+                    spt_preds.reshape(-1),
+                    spt_y.reshape(-1),
+                )
                 total_spt_loss += loss
             avg_spt_loss = total_spt_loss / len(support_loader)
             self.inner_optimizer.zero_grad()
             avg_spt_loss.backward()
             self.inner_optimizer.step()
         # 获取适应后的参数
-        adapted_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+        adapted_state = self._snapshot_trainable_state()
         
         # 恢复原始参数
-        self.model.load_state_dict(original_state)
+        self._load_trainable_state(original_state)
         
         return adapted_state
 
@@ -70,9 +102,9 @@ class ReptileTrainer(BaseTrainer):
             adapted_state = self.adapt_on_support_set(task_data)
             
             # adapt_on_support_set中已将模型参数还原为原始参数
-            original_state = {k: v.clone() for k, v in self.model.state_dict().items()}
+            original_state = self._snapshot_trainable_state()
             #使用适应后的参数进行预测
-            self.model.load_state_dict(adapted_state)
+            self._load_trainable_state(adapted_state)
             
             accs_qry = [task_data['opt_id']]
             x_qry = [task_data['opt_seq']]
@@ -80,10 +112,13 @@ class ReptileTrainer(BaseTrainer):
             
             with torch.no_grad():
                 qry_preds = self.model(accs_qry, x_qry)
-                qry_loss = nn.MSELoss()(qry_preds.squeeze(), y_qry)
+                qry_loss = nn.MSELoss()(
+                    qry_preds.reshape(-1),
+                    y_qry.reshape(-1),
+                )
             
             # 恢复原始参数
-            self.model.load_state_dict(original_state)
+            self._load_trainable_state(original_state)
             
             return qry_loss.item(), qry_preds.item(), y_qry.item()
         
@@ -107,7 +142,10 @@ class ReptileTrainer(BaseTrainer):
                                 grad = (adapted_state[name] - param) * self.meta_lr
                                 param.data.add_(grad)
                         qry_preds = self.model([task_data['opt_id']], [task_data['opt_seq']])
-                        qry_loss = nn.MSELoss()(qry_preds.squeeze(), task_data['opt_pH'].to(device))
+                        qry_loss = nn.MSELoss()(
+                            qry_preds.reshape(-1),
+                            task_data['opt_pH'].to(device).reshape(-1),
+                        )
                         meta_batch_loss += qry_loss.item()
                 # 计算平均损失
                 meta_batch_loss /= len(batch)
@@ -118,8 +156,7 @@ class ReptileTrainer(BaseTrainer):
                 avg_loss = epoch_loss / num_batches
                 if global_step % LOGGING_INTERVAL == 0:
                     self.writer.add_scalar('Loss/train_moving_avg', avg_loss, global_step)
-                    self.writer.flush()
-                print(f'Step {global_step}, Train Loss: {avg_loss:.4f}')
+                    print(f'Step {global_step}, Train Loss: {avg_loss:.4f}')
                 global_step += 1
                 
                 # 验证
@@ -130,13 +167,14 @@ class ReptileTrainer(BaseTrainer):
                     self.writer.flush()
                     
                     if self.early_stopping(valid_loss, global_step):
-                        self.model.load_state_dict(self.best_model)
+                        self.restore_best_model()
                         return
             
             # 每个epoch结束时的记录
             avg_epoch_loss = epoch_loss / num_batches
             print(f'Epoch {epoch+1}, Average Train Loss: {avg_epoch_loss:.4f}')
             self.writer.add_scalar('Loss/train_epoch', avg_epoch_loss, epoch)
+            self.writer.flush()
 
     def validate(self):
         total_loss = 0.0
@@ -173,9 +211,15 @@ class ReptileTrainer(BaseTrainer):
 def get_run_name(args):
     """生成包含关键配置参数的唯一运行名称"""
     pretrained_int = 1 if args.pretrained else 0
-    return f"reptile_{args.retrieval_strategy}_topk{args.topk}_mlr{args.meta_lr}_ilr{args.inner_lr}_ep{args.num_epochs}_ve{args.validate_every}_pr{pretrained_int}_pt{int(args.patience)}"
+    return (
+        f"reptile_{args.retrieval_strategy}_topk{args.topk}"
+        f"_mlr{args.meta_lr}_ilr{args.inner_lr}_ep{args.num_epochs}"
+        f"_ve{args.validate_every}_pr{pretrained_int}_pt{int(args.patience)}"
+        f"_is{args.inner_steps}_sbs{args.support_batch_size}_seed{args.seed}"
+    )
 
 def main(args):
+    seed_everything(args.seed)
     run_name = get_run_name(args)
     args.save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -193,22 +237,30 @@ def main(args):
         test_dataset = ProteinpHDataset(os.path.join(data_dir, 'retrieval_test.json'))
 
     # 创建数据加载器
-    train_loader = DataLoader(train_dataset, batch_size=5, shuffle=True, 
-                            collate_fn=lambda x: x, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=5, shuffle=True,
+                            collate_fn=lambda x: x, num_workers=4, pin_memory=True,
+                            generator=make_generator(args.seed), worker_init_fn=seed_worker)
     valid_loader = DataLoader(valid_dataset, batch_size=10, shuffle=False, 
                             collate_fn=lambda x: x, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=10, shuffle=False, 
                            collate_fn=lambda x: x, num_workers=4, pin_memory=True)
     
     # 初始化模型和训练器
-    model = pHPredictionModel(pretrained=args.pretrained).to(device)
+    embedding_cache_dir = None if args.disable_embedding_cache else args.embedding_cache_dir
+    model = pHPredictionModel(
+        pretrained=args.pretrained,
+        embedding_cache_dir=embedding_cache_dir,
+        embedding_memory_cache_size=args.embedding_memory_cache_size,
+    ).to(device)
+    seed_everything(args.seed)
     trainer = ReptileTrainer(
         model, train_loader, valid_loader, test_loader,
         args.meta_lr, args.inner_lr, args.num_epochs,
         writer, args.save_dir, patience=args.patience,
         min_delta=args.min_delta, validate_every=args.validate_every,
         support_batch_size=args.support_batch_size,
-        inner_steps=args.inner_steps
+        inner_steps=args.inner_steps,
+        seed=args.seed,
     )
 
     if args.mode == 'train':
@@ -217,9 +269,7 @@ def main(args):
     elif args.mode == 'test':
         model_path = os.path.join(args.save_dir, 'best_model.pth')
         if os.path.exists(model_path):
-            state_dict = torch.load(model_path)
-            # print(state_dict)
-            trainer.model.load_state_dict(state_dict['model_state_dict'])
+            trainer.load_model_checkpoint(model_path)
             trainer.model = trainer.model.to(device)
         else:
             raise FileNotFoundError(f"No model found at {model_path}")
@@ -251,6 +301,14 @@ if __name__ == "__main__":
     parser.add_argument('--patience', type=int, default=5)
     parser.add_argument('--min_delta', type=float, default=0.0001)
     parser.add_argument('--validate_every', type=int, default=200)
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument(
+        '--embedding_cache_dir',
+        type=str,
+        default='./data/features/esm1v_t33_650M_UR90S_1',
+    )
+    parser.add_argument('--embedding_memory_cache_size', type=int, default=256)
+    parser.add_argument('--disable_embedding_cache', action='store_true')
     parser.add_argument("--retrieval_strategy", default="opt_retrieval",
                       choices=["opt_retrieval","opt_random","opt_fixed_random",
                                "opt_retrieval_scaled_0.2", 

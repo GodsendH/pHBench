@@ -11,7 +11,14 @@ import argparse
 from torch.utils.tensorboard import SummaryWriter
 
 from models import pHPredictionModel, ProteinpHDataset, SupportDataset
-from utils import BaseTrainer, calculate_metrics, print_metrics
+from utils import (
+    BaseTrainer,
+    calculate_metrics,
+    make_generator,
+    print_metrics,
+    seed_everything,
+    seed_worker,
+)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LOGGING_INTERVAL = 10
@@ -19,7 +26,7 @@ LOGGING_INTERVAL = 10
 class MAMLTrainer(BaseTrainer):
     def __init__(self, model, train_loader, valid_loader, test_loader, meta_lr,
                  inner_lr, num_epochs, writer, save_dir, patience=3, min_delta=0.001,
-                 validate_every=10, support_batch_size=1, inner_steps=5):
+                 validate_every=10, support_batch_size=1, inner_steps=5, seed=0):
         super().__init__(model, train_loader, valid_loader, test_loader,
                         writer, save_dir, patience, min_delta, validate_every)
         
@@ -29,6 +36,7 @@ class MAMLTrainer(BaseTrainer):
         self.num_epochs = num_epochs
         self.support_batch_size = support_batch_size
         self.inner_steps = inner_steps
+        self.support_generator = make_generator(seed)
         
         # Initialize MAML algorithm
         self.maml = l2l.algorithms.MAML(self.model, lr=self.inner_lr, first_order=False)
@@ -37,7 +45,12 @@ class MAMLTrainer(BaseTrainer):
     def adapt_on_support_set(self, learner, task_data):
         accs_spt, x_spt, y_spt = task_data['env_ids'], task_data['env_seqs'], task_data['env_pHs'].to(device)
         support_dataset = SupportDataset(accs_spt, x_spt, y_spt)
-        support_loader = DataLoader(support_dataset, batch_size=self.support_batch_size, shuffle=True)
+        support_loader = DataLoader(
+            support_dataset,
+            batch_size=self.support_batch_size,
+            shuffle=True,
+            generator=self.support_generator,
+        )
         
         for _ in range(self.inner_steps):
             total_spt_loss = 0.0
@@ -94,8 +107,7 @@ class MAMLTrainer(BaseTrainer):
                 avg_loss = epoch_loss / num_batches
                 if global_step % LOGGING_INTERVAL == 0:
                     self.writer.add_scalar('Loss/train_moving_avg', avg_loss, global_step)
-                    self.writer.flush()
-                print(f'Step {global_step}, Train Loss: {avg_loss:.4f}')
+                    print(f'Step {global_step}, Train Loss: {avg_loss:.4f}')
                 global_step += 1
                 
                 # Validation
@@ -106,13 +118,14 @@ class MAMLTrainer(BaseTrainer):
                     self.writer.flush()
                     
                     if self.early_stopping(valid_loss, global_step):
-                        self.model.load_state_dict(self.best_model)
+                        self.restore_best_model()
                         return
 
             # End of epoch logging
             avg_epoch_loss = epoch_loss / num_batches
             print(f'Epoch {epoch+1}, Average Train Loss: {avg_epoch_loss:.4f}')
             self.writer.add_scalar('Loss/train_epoch', avg_epoch_loss, epoch)
+            self.writer.flush()
 
     def validate(self):
         total_loss = 0.0
@@ -148,9 +161,15 @@ class MAMLTrainer(BaseTrainer):
 def get_run_name(args):
     """Generate a unique run name containing key configuration parameters"""
     pretrained_int = 1 if args.pretrained else 0
-    return f"maml_{args.retrieval_strategy}_topk{args.topk}_mlr{args.meta_lr}_ilr{args.inner_lr}_ep{args.num_epochs}_ve{args.validate_every}_pr{pretrained_int}_pt{int(args.patience)}"
+    return (
+        f"maml_{args.retrieval_strategy}_topk{args.topk}"
+        f"_mlr{args.meta_lr}_ilr{args.inner_lr}_ep{args.num_epochs}"
+        f"_ve{args.validate_every}_pr{pretrained_int}_pt{int(args.patience)}"
+        f"_is{args.inner_steps}_sbs{args.support_batch_size}_seed{args.seed}"
+    )
 
 def main(args):
+    seed_everything(args.seed)
     run_name = get_run_name(args)
     args.save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -168,19 +187,33 @@ def main(args):
         test_dataset = ProteinpHDataset(os.path.join(data_dir, 'retrieval_test.json'))
 
     # Create dataloaders
-    train_loader = DataLoader(train_dataset, batch_size=5, shuffle=True, collate_fn=lambda x: x)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=5,
+        shuffle=True,
+        collate_fn=lambda x: x,
+        generator=make_generator(args.seed),
+        worker_init_fn=seed_worker,
+    )
     valid_loader = DataLoader(valid_dataset, batch_size=1, shuffle=False, collate_fn=lambda x: x)
     test_loader = DataLoader(test_dataset, batch_size=10, shuffle=False, collate_fn=lambda x: x)
     
     # Initialize model and trainer
-    model = pHPredictionModel(pretrained=args.pretrained).to(device)
+    embedding_cache_dir = None if args.disable_embedding_cache else args.embedding_cache_dir
+    model = pHPredictionModel(
+        pretrained=args.pretrained,
+        embedding_cache_dir=embedding_cache_dir,
+        embedding_memory_cache_size=args.embedding_memory_cache_size,
+    ).to(device)
+    seed_everything(args.seed)
     trainer = MAMLTrainer(
         model, train_loader, valid_loader, test_loader,
         args.meta_lr, args.inner_lr, args.num_epochs,
         writer, args.save_dir, patience=args.patience,
         min_delta=args.min_delta, validate_every=args.validate_every,
         support_batch_size=args.support_batch_size,
-        inner_steps=args.inner_steps
+        inner_steps=args.inner_steps,
+        seed=args.seed,
     )
 
     if args.mode == 'train':
@@ -189,13 +222,7 @@ def main(args):
     elif args.mode == 'test':
         model_path = os.path.join(args.save_dir, 'best_model.pth')
         if os.path.exists(model_path):
-            state_dict = torch.load(model_path)
-            # 只移除开头的"module."前缀
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                name = k[7:] if k.startswith("module.") else k  
-                new_state_dict[name] = v
-            trainer.model.load_state_dict(new_state_dict)
+            trainer.load_model_checkpoint(model_path)
             trainer.model = trainer.model.to(device)
         else:
             raise FileNotFoundError(f"No model found at {model_path}")
@@ -227,6 +254,14 @@ if __name__ == "__main__":
     parser.add_argument('--patience', type=int, default=5)
     parser.add_argument('--min_delta', type=float, default=0.0001)
     parser.add_argument('--validate_every', type=int, default=200)
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument(
+        '--embedding_cache_dir',
+        type=str,
+        default='./data/features/esm1v_t33_650M_UR90S_1',
+    )
+    parser.add_argument('--embedding_memory_cache_size', type=int, default=256)
+    parser.add_argument('--disable_embedding_cache', action='store_true')
     parser.add_argument("--retrieval_strategy", default="opt_retrieval",
                       choices=["opt_retrieval","opt_random","opt_fixed_random"])
     parser.add_argument('--random_test', action='store_true')
