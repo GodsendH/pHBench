@@ -211,3 +211,77 @@ Please cite our work if you use this code in your research:
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+## pH-GeoFuse
+
+`phgeofuse` is the structure-aware successor implemented alongside the original
+Venus-DREAM entry points. It combines cached SaProt-650M residue embeddings, a
+residue EGNN, pH-conditioned ionization features, and homology-aware SaProt and
+Foldseek retrieval. The original MAML/Reptile workflow remains unchanged.
+
+Upgrade the existing environment without replacing its PyTorch/CUDA stack:
+
+```bash
+bash scripts/install_phgeofuse.sh phbench
+conda activate phbench
+python -m phgeofuse.doctor --config configs/phgeofuse_phopt.yaml
+```
+
+Prepare structures and graph features online, then cache frozen SaProt features:
+
+```bash
+python -m phgeofuse.prepare --config configs/phgeofuse_phopt.yaml --online
+torchrun --standalone --nproc_per_node=1 \
+  -m phgeofuse.encode --config configs/phgeofuse_phopt.yaml
+```
+
+The preparation command first validates an AlphaFold DB structure against the
+exact PHOPT FASTA sequence. Missing or mismatched entries use ESMFold. Use
+`--offline` on machines without network access; it fails with a complete list of
+missing artifacts instead of attempting downloads.
+
+Train on one or more GPUs with the same command shape. `global_batch_size` is
+kept constant by automatically changing gradient accumulation with world size.
+
+```bash
+torchrun --standalone --nproc_per_node=4 \
+  -m phgeofuse.train --config configs/phgeofuse_phopt.yaml
+
+torchrun --standalone --nproc_per_node=4 \
+  -m phgeofuse.evaluate --config configs/phgeofuse_phopt.yaml \
+  --checkpoint artifacts/phgeofuse/runs/phgeofuse_phopt_frozen_seed42/best.pt
+```
+
+For multi-node execution, replace `--standalone` with the normal `torchrun`
+`--nnodes`, `--node_rank`, `--master_addr`, and `--master_port` arguments. All
+nodes must see the same manifest, structures, feature cache, and model cache.
+
+Set `model.mode: lora` to fine-tune SaProt attention projections with LoRA. The
+default `frozen` mode is substantially cheaper and reads fp16 residue embeddings
+created by `phgeofuse.encode`.
+
+Available controlled ablations are `saprot_only`, `geometry`, `ph_conditioned`,
+`saprot_retrieval`, and `full`:
+
+```bash
+torchrun --standalone --nproc_per_node=4 -m phgeofuse.train \
+  --config configs/phgeofuse_phopt.yaml --ablation geometry
+```
+
+Predict directly from an unlabeled FASTA. The checkpoint embeds its resolved
+configuration; `--config` remains available when cache paths differ on another
+machine.
+
+```bash
+python -m phgeofuse.predict --fasta proteins.fasta \
+  --checkpoint artifacts/phgeofuse/runs/phgeofuse_phopt_frozen_seed42/best.pt \
+  --offline
+```
+
+Run lightweight tests and the two-process CPU distributed smoke test with:
+
+```bash
+python -m unittest tests.test_phgeofuse
+torchrun --standalone --nproc_per_node=2 tests/phgeofuse_ddp_smoke.py
+torchrun --standalone --nproc_per_node=2 tests/phgeofuse_training_ddp_smoke.py
+```

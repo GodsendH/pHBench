@@ -1,0 +1,14 @@
+# Additive dependencies for the existing phbench environment.
+# Core versions are repeated so pip cannot silently upgrade the CUDA stack.
+torch==2.0.0
+transformers==4.40.0
+numpy==1.26.1
+accelerate==0.29.3
+peft==0.10.0
+biotite==0.39.0
+propka==3.5.1
+faiss-cpu==1.8.0.post1
+tenacity==8.2.3
+safetensors==0.4.3
+PyYAML==6.0.2
+requests==2.32.3
