@@ -1,46 +1,88 @@
-import os
-import torch
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
-from torch import nn
-from torch.utils.data import DataLoader
-import time
 import argparse
+import os
+
+import pandas as pd
+import torch
+from torch import nn
+from torch.nn.utils import parameters_to_vector
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 from models import pHPredictionModel, ProteinpHDataset, SupportDataset
 from utils import (
     BaseTrainer,
+    DistributedMetaBatchSampler,
+    DistributedShardSampler,
+    NullSummaryWriter,
     calculate_metrics,
+    initialize_distributed,
     make_generator,
     print_metrics,
     seed_everything,
     seed_worker,
 )
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 LOGGING_INTERVAL = 10
-    
+
+
+def collate_tasks(batch):
+    return batch
+
+
 class ReptileTrainer(BaseTrainer):
     def __init__(self, model, train_loader, valid_loader, test_loader, meta_lr,
-                 inner_lr, num_epochs, writer, save_dir, patience=3, min_delta=0.001,
-                 validate_every=10, support_batch_size=1, inner_steps=5, seed=0):
-        super().__init__(model, train_loader, valid_loader, test_loader,
-                        writer, save_dir, patience, min_delta, validate_every)
-        
-        # Reptile specific initialization
+                 inner_lr, num_epochs, writer, save_dir, distributed_context,
+                 train_batch_sampler, patience=3, min_delta=0.001,
+                 validate_every=10, support_batch_size=1, inner_steps=5,
+                 seed=0):
+        super().__init__(
+            model,
+            train_loader,
+            valid_loader,
+            test_loader,
+            writer,
+            save_dir,
+            patience,
+            min_delta,
+            validate_every,
+        )
         self.meta_lr = meta_lr
         self.inner_lr = inner_lr
         self.num_epochs = num_epochs
         self.support_batch_size = support_batch_size
         self.inner_steps = inner_steps
-        self.support_generator = make_generator(seed)
-        
+        self.distributed_context = distributed_context
+        self.train_batch_sampler = train_batch_sampler
+        self.device = distributed_context.device
+        self.support_generator = make_generator(seed + distributed_context.rank)
+        self.trainable_params = self.model.get_trainable_params()
         self.inner_optimizer = torch.optim.SGD(
-            self.model.get_trainable_params(),
+            self.trainable_params,
             lr=self.inner_lr,
         )
+        self.synchronize_trainable_parameters()
+
+    @property
+    def is_main(self):
+        return self.distributed_context.is_main
+
+    def _snapshot_trainable_vector(self):
+        detached = [param.detach() for param in self.trainable_params]
+        return parameters_to_vector(detached).clone()
+
+    def _load_trainable_vector(self, vector):
+        pointer = 0
+        with torch.no_grad():
+            for param in self.trainable_params:
+                numel = param.numel()
+                values = vector[pointer:pointer + numel].view_as(param)
+                param.copy_(values)
+                pointer += numel
+
+        if pointer != vector.numel():
+            raise ValueError('Trainable parameter vector has an invalid size.')
 
     def _snapshot_trainable_state(self):
         return {
@@ -55,265 +97,456 @@ class ReptileTrainer(BaseTrainer):
                 if param.requires_grad:
                     param.copy_(state[name])
 
-    def adapt_on_support_set(self, task_data):
-        """执行内循环适应"""
-        # 保存原始参数
-        original_state = self._snapshot_trainable_state()
-        
-        # 一次性处理所有support set数据
-        accs_spt, x_spt, y_spt = task_data['env_ids'], task_data['env_seqs'], task_data['env_pHs'].to(device)
-        support_dataset = SupportDataset(accs_spt, x_spt, y_spt)
+    def synchronize_trainable_parameters(self):
+        vector = self._snapshot_trainable_vector()
+        self.distributed_context.broadcast(vector, source=0)
+        self._load_trainable_vector(vector)
+
+    def _adapt_current_model(self, task_data):
+        support_dataset = SupportDataset(
+            task_data['env_ids'],
+            task_data['env_seqs'],
+            task_data['env_pHs'],
+        )
         support_loader = DataLoader(
             support_dataset,
             batch_size=self.support_batch_size,
             shuffle=True,
             generator=self.support_generator,
         )
-        
+
         for _ in range(self.inner_steps):
-            total_spt_loss = 0.0
-            for spt_batch in support_loader:
-                spt_accs, spt_x, spt_y = spt_batch
-                spt_preds = self.model(spt_accs, spt_x)
-                loss = nn.MSELoss()(
-                    spt_preds.reshape(-1),
-                    spt_y.reshape(-1),
+            total_support_loss = None
+            for support_batch in support_loader:
+                support_accs, support_sequences, support_targets = support_batch
+                support_targets = support_targets.to(
+                    self.device,
+                    non_blocking=True,
                 )
-                total_spt_loss += loss
-            avg_spt_loss = total_spt_loss / len(support_loader)
-            self.inner_optimizer.zero_grad()
-            avg_spt_loss.backward()
+                support_predictions = self.model(
+                    support_accs,
+                    support_sequences,
+                )
+                support_loss = nn.MSELoss()(
+                    support_predictions.reshape(-1),
+                    support_targets.reshape(-1),
+                )
+                if total_support_loss is None:
+                    total_support_loss = support_loss
+                else:
+                    total_support_loss = total_support_loss + support_loss
+
+            if total_support_loss is None:
+                raise ValueError('A Reptile task must contain support examples.')
+
+            average_support_loss = total_support_loss / len(support_loader)
+            self.inner_optimizer.zero_grad(set_to_none=True)
+            average_support_loss.backward()
             self.inner_optimizer.step()
-        # 获取适应后的参数
-        adapted_state = self._snapshot_trainable_state()
-        
-        # 恢复原始参数
-        self._load_trainable_state(original_state)
-        
-        return adapted_state
 
+    def _query_task(self, task_data):
+        query_targets = task_data['opt_pH'].to(self.device).reshape(-1)
+        with torch.no_grad():
+            query_predictions = self.model(
+                [task_data['opt_id']],
+                [task_data['opt_seq']],
+            ).reshape(-1)
+            query_loss = nn.MSELoss()(query_predictions, query_targets)
 
-    def process_task(self, task_data, train=True):
-        if train:
-            # 训练模式：返回适应后的参数
-            return self.adapt_on_support_set(task_data)
-        else:
-            # 评估模式：计算损失和预测值
-            adapted_state = self.adapt_on_support_set(task_data)
-            
-            # adapt_on_support_set中已将模型参数还原为原始参数
-            original_state = self._snapshot_trainable_state()
-            #使用适应后的参数进行预测
-            self._load_trainable_state(adapted_state)
-            
-            accs_qry = [task_data['opt_id']]
-            x_qry = [task_data['opt_seq']]
-            y_qry = task_data['opt_pH'].unsqueeze(0).to(device)
-            
-            with torch.no_grad():
-                qry_preds = self.model(accs_qry, x_qry)
-                qry_loss = nn.MSELoss()(
-                    qry_preds.reshape(-1),
-                    y_qry.reshape(-1),
-                )
-            
-            # 恢复原始参数
-            self._load_trainable_state(original_state)
-            
-            return qry_loss.item(), qry_preds.item(), y_qry.item()
-        
-    
-                    
+        return (
+            query_loss.item(),
+            query_predictions.item(),
+            query_targets.item(),
+        )
+
+    def _run_local_meta_batch(self, batch):
+        base_vector = self._snapshot_trainable_vector()
+        local_delta_sum = torch.zeros_like(base_vector)
+        local_query_loss_sum = 0.0
+        local_task_count = 0
+
+        for task_data in batch:
+            self._load_trainable_vector(base_vector)
+            self._adapt_current_model(task_data)
+            adapted_vector = self._snapshot_trainable_vector()
+            query_loss, _, _ = self._query_task(task_data)
+
+            local_delta_sum.add_(adapted_vector)
+            local_delta_sum.sub_(base_vector)
+            local_query_loss_sum += query_loss
+            local_task_count += 1
+
+        self._load_trainable_vector(base_vector)
+        return (
+            base_vector,
+            local_delta_sum,
+            local_query_loss_sum,
+            local_task_count,
+        )
+
+    def _apply_distributed_meta_update(self, base_vector, local_delta_sum,
+                                       local_query_loss_sum, local_task_count):
+        self.distributed_context.all_reduce(local_delta_sum)
+
+        statistics = torch.tensor(
+            [local_query_loss_sum, float(local_task_count)],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        self.distributed_context.all_reduce(statistics)
+        global_task_count = statistics[1].item()
+        if global_task_count == 0:
+            raise RuntimeError('The global Reptile meta-batch is empty.')
+
+        local_delta_sum.div_(global_task_count)
+        local_delta_sum.mul_(self.meta_lr)
+        local_delta_sum.add_(base_vector)
+        self._load_trainable_vector(local_delta_sum)
+        return statistics[0].item() / global_task_count
+
+    def _broadcast_early_stopping(self, valid_loss, global_step):
+        should_stop = False
+        if self.is_main:
+            print(f'Step {global_step}, Validation Loss: {valid_loss:.4f}')
+            self.writer.add_scalar('Loss/validation', valid_loss, global_step)
+            self.writer.flush()
+            should_stop = self.early_stopping(valid_loss, global_step)
+
+        stop_tensor = torch.tensor(
+            int(should_stop),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.distributed_context.broadcast(stop_tensor, source=0)
+        should_stop = bool(stop_tensor.item())
+
+        if should_stop:
+            if self.is_main:
+                self.restore_best_model()
+            self.synchronize_trainable_parameters()
+
+        return should_stop
+
     def train(self):
         global_step = 0
         for epoch in range(self.num_epochs):
+            self.train_batch_sampler.set_epoch(epoch)
             epoch_loss = 0.0
             num_batches = 0
-            
-            for batch_idx, batch in enumerate(tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.num_epochs}")):
-                meta_batch_loss = 0.0
-                # 适应每个任务
-                for task_data in batch:
-                    adapted_state = self.process_task(task_data)
-                    # 计算并应用元梯度更新
-                    with torch.no_grad():
-                        for name, param in self.model.named_parameters():
-                            if param.requires_grad:
-                                grad = (adapted_state[name] - param) * self.meta_lr
-                                param.data.add_(grad)
-                        qry_preds = self.model([task_data['opt_id']], [task_data['opt_seq']])
-                        qry_loss = nn.MSELoss()(
-                            qry_preds.reshape(-1),
-                            task_data['opt_pH'].to(device).reshape(-1),
-                        )
-                        meta_batch_loss += qry_loss.item()
-                # 计算平均损失
-                meta_batch_loss /= len(batch)
+            progress = tqdm(
+                self.train_loader,
+                desc=f'Epoch {epoch + 1}/{self.num_epochs}',
+                disable=not self.is_main,
+            )
+
+            for batch in progress:
+                batch_results = self._run_local_meta_batch(batch)
+                meta_batch_loss = self._apply_distributed_meta_update(
+                    *batch_results,
+                )
                 epoch_loss += meta_batch_loss
                 num_batches += 1
-                
-                # 记录训练进度
-                avg_loss = epoch_loss / num_batches
-                if global_step % LOGGING_INTERVAL == 0:
-                    self.writer.add_scalar('Loss/train_moving_avg', avg_loss, global_step)
-                    print(f'Step {global_step}, Train Loss: {avg_loss:.4f}')
+
+                average_loss = epoch_loss / num_batches
+                if self.is_main and global_step % LOGGING_INTERVAL == 0:
+                    self.writer.add_scalar(
+                        'Loss/train_moving_avg',
+                        average_loss,
+                        global_step,
+                    )
+                    print(f'Step {global_step}, Train Loss: {average_loss:.4f}')
                 global_step += 1
-                
-                # 验证
+
                 if global_step % self.validate_every == 0:
                     valid_loss = self.validate()
-                    print(f'Step {global_step}, Validation Loss: {valid_loss:.4f}')
-                    self.writer.add_scalar('Loss/validation', valid_loss, global_step)
-                    self.writer.flush()
-                    
-                    if self.early_stopping(valid_loss, global_step):
-                        self.restore_best_model()
+                    if self._broadcast_early_stopping(valid_loss, global_step):
                         return
-            
-            # 每个epoch结束时的记录
-            avg_epoch_loss = epoch_loss / num_batches
-            print(f'Epoch {epoch+1}, Average Train Loss: {avg_epoch_loss:.4f}')
-            self.writer.add_scalar('Loss/train_epoch', avg_epoch_loss, epoch)
-            self.writer.flush()
+
+            if self.is_main:
+                average_epoch_loss = epoch_loss / num_batches
+                print(
+                    f'Epoch {epoch + 1}, '
+                    f'Average Train Loss: {average_epoch_loss:.4f}'
+                )
+                self.writer.add_scalar(
+                    'Loss/train_epoch',
+                    average_epoch_loss,
+                    epoch,
+                )
+                self.writer.flush()
+
+        if self.is_main and self.best_model is not None:
+            self.restore_best_model()
+        self.synchronize_trainable_parameters()
 
     def validate(self):
-        total_loss = 0.0
-        num_batches = 0
-        for batch in tqdm(self.valid_loader, desc="Validation"):
+        base_vector = self._snapshot_trainable_vector()
+        local_loss_sum = 0.0
+        local_task_count = 0
+        progress = tqdm(
+            self.valid_loader,
+            desc='Validation',
+            disable=not self.is_main,
+        )
+
+        for batch in progress:
             for task_data in batch:
-                qry_loss, _, _ = self.process_task(task_data, train=False)
-                total_loss += qry_loss
-            num_batches += 1
-        return total_loss / num_batches
+                self._load_trainable_vector(base_vector)
+                self._adapt_current_model(task_data)
+                query_loss, _, _ = self._query_task(task_data)
+                local_loss_sum += query_loss
+                local_task_count += 1
+
+        self._load_trainable_vector(base_vector)
+        statistics = torch.tensor(
+            [local_loss_sum, float(local_task_count)],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        self.distributed_context.all_reduce(statistics)
+        if statistics[1].item() == 0:
+            raise RuntimeError('The validation dataset is empty.')
+        return statistics[0].item() / statistics[1].item()
 
     def test(self):
+        if not self.is_main:
+            return []
+
+        base_vector = self._snapshot_trainable_vector()
         predictions = []
         true_pHs = []
         predicted_pHs = []
-        
-        for batch in tqdm(self.test_loader, desc="Testing"):
+
+        for batch in tqdm(self.test_loader, desc='Testing'):
             for task_data in batch:
-                _, pred_pH, true_pH = self.process_task(task_data, train=False)
+                self._load_trainable_vector(base_vector)
+                self._adapt_current_model(task_data)
+                _, predicted_pH, true_pH = self._query_task(task_data)
                 predictions.append({
                     'opt_id': task_data['opt_id'],
                     'true_pH': true_pH,
-                    'predicted_pH': pred_pH
+                    'predicted_pH': predicted_pH,
                 })
-                # print(predictions)
                 true_pHs.append(true_pH)
-                predicted_pHs.append(pred_pH)
-        
+                predicted_pHs.append(predicted_pH)
+
+        self._load_trainable_vector(base_vector)
         metrics = calculate_metrics(true_pHs, predicted_pHs)
         print_metrics(metrics)
-        
         return predictions
 
-def get_run_name(args):
-    """生成包含关键配置参数的唯一运行名称"""
+
+def get_run_name(args, world_size=1):
     pretrained_int = 1 if args.pretrained else 0
     return (
-        f"reptile_{args.retrieval_strategy}_topk{args.topk}"
-        f"_mlr{args.meta_lr}_ilr{args.inner_lr}_ep{args.num_epochs}"
-        f"_ve{args.validate_every}_pr{pretrained_int}_pt{int(args.patience)}"
-        f"_is{args.inner_steps}_sbs{args.support_batch_size}_seed{args.seed}"
+        f'reptile_{args.retrieval_strategy}_topk{args.topk}'
+        f'_mlr{args.meta_lr}_ilr{args.inner_lr}_ep{args.num_epochs}'
+        f'_ve{args.validate_every}_pr{pretrained_int}_pt{int(args.patience)}'
+        f'_is{args.inner_steps}_sbs{args.support_batch_size}'
+        f'_gbs{args.meta_batch_size}_seed{args.seed}_ws{world_size}'
     )
+
+
+def create_data_loader_kwargs(args, device):
+    kwargs = {
+        'num_workers': args.num_workers,
+        'pin_memory': device.type == 'cuda',
+        'worker_init_fn': seed_worker,
+    }
+    if args.num_workers > 0:
+        kwargs['persistent_workers'] = True
+    return kwargs
+
 
 def main(args):
-    seed_everything(args.seed)
-    run_name = get_run_name(args)
-    args.save_dir = os.path.join(args.save_dir, run_name)
-    os.makedirs(args.save_dir, exist_ok=True)
-    
-    args.log_dir = os.path.join(args.log_dir, run_name)
-    writer = SummaryWriter(log_dir=args.log_dir)
+    distributed_context = initialize_distributed(args.distributed_backend)
+    writer = None
 
-    # 加载数据集
-    data_dir = os.path.join('data/processed', f'top{args.topk}', f'esm2_{args.retrieval_strategy}')
-    train_dataset = ProteinpHDataset(os.path.join(data_dir, 'retrieval_train.json'))
-    valid_dataset = ProteinpHDataset(os.path.join(data_dir, 'retrieval_valid.json'))
-    if args.random_test:
-        test_dataset = ProteinpHDataset(os.path.join('data/processed/top5/esm2_opt_random', 'retrieval_test.json'))
-    else:
-        test_dataset = ProteinpHDataset(os.path.join(data_dir, 'retrieval_test.json'))
+    try:
+        seed_everything(args.seed)
+        run_name = get_run_name(args, distributed_context.world_size)
+        save_dir = os.path.join(args.save_dir, run_name)
+        log_dir = os.path.join(args.log_dir, run_name)
 
-    # 创建数据加载器
-    train_loader = DataLoader(train_dataset, batch_size=5, shuffle=True,
-                            collate_fn=lambda x: x, num_workers=4, pin_memory=True,
-                            generator=make_generator(args.seed), worker_init_fn=seed_worker)
-    valid_loader = DataLoader(valid_dataset, batch_size=10, shuffle=False, 
-                            collate_fn=lambda x: x, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=10, shuffle=False, 
-                           collate_fn=lambda x: x, num_workers=4, pin_memory=True)
-    
-    # 初始化模型和训练器
-    embedding_cache_dir = None if args.disable_embedding_cache else args.embedding_cache_dir
-    model = pHPredictionModel(
-        pretrained=args.pretrained,
-        embedding_cache_dir=embedding_cache_dir,
-        embedding_memory_cache_size=args.embedding_memory_cache_size,
-    ).to(device)
-    seed_everything(args.seed)
-    trainer = ReptileTrainer(
-        model, train_loader, valid_loader, test_loader,
-        args.meta_lr, args.inner_lr, args.num_epochs,
-        writer, args.save_dir, patience=args.patience,
-        min_delta=args.min_delta, validate_every=args.validate_every,
-        support_batch_size=args.support_batch_size,
-        inner_steps=args.inner_steps,
-        seed=args.seed,
-    )
+        if distributed_context.is_main:
+            os.makedirs(save_dir, exist_ok=True)
+            os.makedirs(args.predictions_dir, exist_ok=True)
+        distributed_context.barrier()
 
-    if args.mode == 'train':
-        trainer.train()
-        predictions = trainer.test()
-    elif args.mode == 'test':
-        model_path = os.path.join(args.save_dir, 'best_model.pth')
-        if os.path.exists(model_path):
-            trainer.load_model_checkpoint(model_path)
-            trainer.model = trainer.model.to(device)
+        if distributed_context.is_main:
+            writer = SummaryWriter(log_dir=log_dir)
+            print(
+                f'Distributed training: world_size={distributed_context.world_size}, '
+                f'global_meta_batch={args.meta_batch_size}'
+            )
         else:
-            raise FileNotFoundError(f"No model found at {model_path}")
-        predictions = trainer.test()
-    else:
-        raise ValueError("Invalid mode. Choose 'train' or 'test'.")
-    
-    # 保存预测结果
-    predictions_file = os.path.join(args.predictions_dir, f'predictions_{run_name}.csv')
-    df_predictions = pd.DataFrame(predictions)
-    df_predictions.to_csv(predictions_file, index=False)
-    print(f"Predictions saved to {predictions_file}")
+            writer = NullSummaryWriter()
 
-    writer.close()
+        data_dir = os.path.join(
+            'data/processed',
+            f'top{args.topk}',
+            f'esm2_{args.retrieval_strategy}',
+        )
+        train_dataset = ProteinpHDataset(
+            os.path.join(data_dir, 'retrieval_train.json'),
+            verbose=distributed_context.is_main,
+        )
+        valid_dataset = ProteinpHDataset(
+            os.path.join(data_dir, 'retrieval_valid.json'),
+            verbose=distributed_context.is_main,
+        )
+        if args.random_test:
+            test_path = os.path.join(
+                'data/processed/top5/esm2_opt_random',
+                'retrieval_test.json',
+            )
+        else:
+            test_path = os.path.join(data_dir, 'retrieval_test.json')
+        test_dataset = ProteinpHDataset(
+            test_path,
+            verbose=distributed_context.is_main,
+        )
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Reptile pH Prediction Model")
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
+        train_batch_sampler = DistributedMetaBatchSampler(
+            len(train_dataset),
+            global_batch_size=args.meta_batch_size,
+            rank=distributed_context.rank,
+            world_size=distributed_context.world_size,
+            shuffle=True,
+            seed=args.seed,
+        )
+        valid_sampler = DistributedShardSampler(
+            len(valid_dataset),
+            rank=distributed_context.rank,
+            world_size=distributed_context.world_size,
+        )
+        loader_kwargs = create_data_loader_kwargs(
+            args,
+            distributed_context.device,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_batch_sampler,
+            collate_fn=collate_tasks,
+            **loader_kwargs,
+        )
+        valid_loader = DataLoader(
+            valid_dataset,
+            batch_size=args.eval_batch_size,
+            sampler=valid_sampler,
+            collate_fn=collate_tasks,
+            **loader_kwargs,
+        )
+        test_loader = None
+        if distributed_context.is_main:
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=args.eval_batch_size,
+                shuffle=False,
+                collate_fn=collate_tasks,
+                **loader_kwargs,
+            )
+
+        embedding_cache_dir = (
+            None if args.disable_embedding_cache else args.embedding_cache_dir
+        )
+        model = pHPredictionModel(
+            pretrained=args.pretrained,
+            embedding_cache_dir=embedding_cache_dir,
+            embedding_memory_cache_size=args.embedding_memory_cache_size,
+            device=distributed_context.device,
+            use_data_parallel=not distributed_context.distributed,
+        ).to(distributed_context.device)
+        seed_everything(args.seed + distributed_context.rank)
+
+        trainer = ReptileTrainer(
+            model,
+            train_loader,
+            valid_loader,
+            test_loader,
+            args.meta_lr,
+            args.inner_lr,
+            args.num_epochs,
+            writer,
+            save_dir,
+            distributed_context,
+            train_batch_sampler,
+            patience=args.patience,
+            min_delta=args.min_delta,
+            validate_every=args.validate_every,
+            support_batch_size=args.support_batch_size,
+            inner_steps=args.inner_steps,
+            seed=args.seed,
+        )
+
+        if args.mode == 'train':
+            trainer.train()
+        elif args.mode == 'test':
+            model_path = args.checkpoint_path or os.path.join(
+                save_dir,
+                'best_model.pth',
+            )
+            if distributed_context.is_main:
+                trainer.load_model_checkpoint(model_path)
+            trainer.synchronize_trainable_parameters()
+        else:
+            raise ValueError('Invalid mode. Choose train or test.')
+
+        distributed_context.barrier()
+        predictions = trainer.test() if distributed_context.is_main else []
+        distributed_context.barrier()
+
+        if distributed_context.is_main:
+            predictions_file = os.path.join(
+                args.predictions_dir,
+                f'predictions_{run_name}.csv',
+            )
+            pd.DataFrame(predictions).to_csv(predictions_file, index=False)
+            print(f'Predictions saved to {predictions_file}')
+    finally:
+        if writer is not None:
+            writer.close()
+        distributed_context.close()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Reptile pH Prediction Model')
+    parser.add_argument('--mode', default='train', choices=['train', 'test'])
     parser.add_argument('--pretrained', action='store_true')
     parser.add_argument('--meta_lr', type=float, default=1)
     parser.add_argument('--inner_lr', type=float, default=0.001)
     parser.add_argument('--num_epochs', type=int, default=50)
-    parser.add_argument('--save_dir', type=str, default='./saved_models')
-    parser.add_argument('--predictions_dir', type=str, default='./predictions')
-    parser.add_argument('--log_dir', type=str, default='./logs')
+    parser.add_argument('--save_dir', default='./saved_models')
+    parser.add_argument('--checkpoint_path')
+    parser.add_argument('--predictions_dir', default='./predictions')
+    parser.add_argument('--log_dir', default='./logs')
+    parser.add_argument('--meta_batch_size', type=int, default=5)
     parser.add_argument('--support_batch_size', type=int, default=1)
+    parser.add_argument('--eval_batch_size', type=int, default=10)
+    parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--inner_steps', type=int, default=5)
     parser.add_argument('--topk', type=int, default=5)
     parser.add_argument('--patience', type=int, default=5)
     parser.add_argument('--min_delta', type=float, default=0.0001)
     parser.add_argument('--validate_every', type=int, default=200)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--distributed_backend', default='nccl')
     parser.add_argument(
         '--embedding_cache_dir',
-        type=str,
         default='./data/features/esm1v_t33_650M_UR90S_1',
     )
     parser.add_argument('--embedding_memory_cache_size', type=int, default=256)
     parser.add_argument('--disable_embedding_cache', action='store_true')
-    parser.add_argument("--retrieval_strategy", default="opt_retrieval",
-                      choices=["opt_retrieval","opt_random","opt_fixed_random",
-                               "opt_retrieval_scaled_0.2", 
-                               "opt_retrieval_scaled_0.6"])
+    parser.add_argument(
+        '--retrieval_strategy',
+        default='opt_retrieval',
+        choices=[
+            'opt_retrieval',
+            'opt_random',
+            'opt_fixed_random',
+            'opt_retrieval_scaled_0.2',
+            'opt_retrieval_scaled_0.6',
+        ],
+    )
     parser.add_argument('--random_test', action='store_true')
-    
-    args = parser.parse_args()
-    main(args)
+    main(parser.parse_args())

@@ -227,11 +227,14 @@ class ResidualLightAttention(nn.Module):
 
 class EpHodModel(nn.Module):
     
-    def __init__(self):
+    def __init__(self, device=None, use_data_parallel=True):
         super(EpHodModel, self).__init__()
         
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        if self.device != 'cuda':
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = torch.device(device)
+        self.use_data_parallel = use_data_parallel
+        if self.device.type != 'cuda':
             print('WARNING: You are not using a GPU which will be slow.')
         self.esm1v_model, self.esm1v_batch_converter = self.load_ESM1v_model()
         self.rlat_model = self.load_RLAT_model()
@@ -281,8 +284,15 @@ class EpHodModel(nn.Module):
         checkpoint = torch.load(rlat_path, map_location=self.device)
         params = utils.read_json(params_path)        
         model = ResidualLightAttention(**params)
-        model = DataParallel(model)
-        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+        state_dict = checkpoint['model_state_dict']
+        if self.use_data_parallel:
+            model = DataParallel(model)
+        else:
+            state_dict = {
+                name[7:] if name.startswith('module.') else name: value
+                for name, value in state_dict.items()
+            }
+        model.load_state_dict(state_dict, strict=True)
         model = model.to(self.device)
 
         return model
@@ -303,4 +313,3 @@ class EpHodModel(nn.Module):
     
     
     
-

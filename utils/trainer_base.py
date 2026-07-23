@@ -51,6 +51,8 @@ class BaseTrainer:
     def restore_model_state(self, state, trainable_only=False):
         if trainable_only:
             self.model.load_trainable_state_dict(state)
+        elif hasattr(self.model, 'load_compatible_state_dict'):
+            self.model.load_compatible_state_dict(state)
         else:
             self.model.load_state_dict(state)
 

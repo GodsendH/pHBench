@@ -5,7 +5,7 @@ from torch.utils.data import Dataset
 SEQUENCE_MAX_LENGTH = 1022
 
 class ProteinpHDataset(Dataset):
-    def __init__(self, data_path):
+    def __init__(self, data_path, verbose=True):
         with open(data_path, 'r') as f:
             data = json.load(f)
         self.data = []
@@ -19,7 +19,8 @@ class ProteinpHDataset(Dataset):
                 'env_ids': item['env_ids']
             }
             self.data.append(processed_item)
-        print(f"Loaded {len(self.data)} items, all sequences truncated to max length {SEQUENCE_MAX_LENGTH}")
+        if verbose:
+            print(f"Loaded {len(self.data)} items, all sequences truncated to max length {SEQUENCE_MAX_LENGTH}")
         
     def __len__(self):
         return len(self.data)
@@ -51,7 +52,6 @@ class SupportDataset(Dataset):
     def collate_fn(batch):
         accs, sequences, pHs = zip(*batch)
         return list(accs), list(sequences), torch.tensor(pHs)
-
 
 
 

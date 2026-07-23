@@ -15,9 +15,13 @@ ESM1V_MODEL_NAME = 'esm1v_t33_650M_UR90S_1'
 
 class pHPredictionModel(nn.Module):
     def __init__(self, pretrained=True, embedding_cache_dir=None,
-                 embedding_memory_cache_size=256):
+                 embedding_memory_cache_size=256, device=None,
+                 use_data_parallel=True):
         super(pHPredictionModel, self).__init__()
-        self.ephod_model = models.EpHodModel()
+        self.ephod_model = models.EpHodModel(
+            device=device,
+            use_data_parallel=use_data_parallel,
+        )
         self.embedding_cache = EmbeddingCache(
             embedding_cache_dir,
             max_memory_items=embedding_memory_cache_size,
@@ -65,10 +69,32 @@ class pHPredictionModel(nn.Module):
         }
 
     def load_trainable_state_dict(self, state):
+        canonical_state = {
+            self._canonical_parameter_name(name): value
+            for name, value in state.items()
+        }
         with torch.no_grad():
             for name, param in self.named_parameters():
                 if param.requires_grad:
-                    param.copy_(state[name])
+                    param.copy_(canonical_state[self._canonical_parameter_name(name)])
+
+    def load_compatible_state_dict(self, state):
+        canonical_state = {
+            self._canonical_parameter_name(name): value
+            for name, value in state.items()
+        }
+        compatible_state = {
+            name: canonical_state[self._canonical_parameter_name(name)]
+            for name in self.state_dict()
+        }
+        self.load_state_dict(compatible_state)
+
+    @staticmethod
+    def _canonical_parameter_name(name):
+        return name.replace(
+            'ephod_model.rlat_model.module.',
+            'ephod_model.rlat_model.',
+        )
     
     def print_trainable_parameters(self):
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)

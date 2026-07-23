@@ -77,7 +77,7 @@ python maml.py \
 
 #### Reptile Training
 
-Train the model using the Reptile algorithm:
+Train the model on one GPU using the Reptile algorithm:
 
 ```bash
 python reptile.py \
@@ -89,10 +89,65 @@ python reptile.py \
     --meta_lr 1 \
     --inner_lr 0.001 \
     --inner_steps 5 \
+    --meta_batch_size 5 \
     --validate_every 200 \
     --patience 5 \
     --seed 0
 ```
+
+For distributed Reptile training, activate the same `phbench` environment on
+every process and launch one process per GPU. Inner-loop task adaptation is
+local to each GPU; one flattened RLAT parameter delta is reduced per global
+meta-batch with NCCL.
+
+Single-node example with two GPUs:
+
+```bash
+conda activate phbench
+export LD_LIBRARY_PATH=/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export CUDA_VISIBLE_DEVICES=0,1
+export OMP_NUM_THREADS=4
+
+torchrun \
+    --standalone \
+    --nnodes=1 \
+    --nproc_per_node=2 \
+    reptile.py \
+    --mode train \
+    --num_epochs 50 \
+    --retrieval_strategy opt_retrieval \
+    --topk 5 \
+    --pretrained \
+    --meta_lr 1 \
+    --inner_lr 0.001 \
+    --inner_steps 5 \
+    --meta_batch_size 5 \
+    --validate_every 200 \
+    --patience 5 \
+    --seed 0
+```
+
+Multi-node launch uses the usual torchrun rendezvous arguments:
+
+```bash
+torchrun \
+    --nnodes="$NUM_NODES" \
+    --nproc_per_node="$GPUS_PER_NODE" \
+    --node_rank="$NODE_RANK" \
+    --master_addr="$MASTER_ADDR" \
+    --master_port="$MASTER_PORT" \
+    reptile.py [training arguments]
+```
+
+`--meta_batch_size` is the global number of tasks per Reptile update and must
+be at least the total process count. Keeping it at 5 preserves the previous
+batch size and is best suited to two GPUs. For four GPUs, a value divisible by
+four, such as 8, improves utilization but changes the optimization trajectory.
+
+The distributed implementation uses standard Reptile meta-batching: every
+task adapts from the same base parameters, task deltas are averaged globally,
+and one outer update is applied. This replaces the old sequential behavior
+where each task updated the base model before the next task.
 
 The frozen ESM1v representations are cached lazily as float32 tensors in
 `data/features/esm1v_t33_650M_UR90S_1`. The first encounter of a sequence
@@ -103,6 +158,9 @@ reuse it. Use `--embedding_cache_dir` to choose another location,
 
 Run names include `inner_steps`, `support_batch_size`, and `seed` so that
 experiments with different adaptation settings do not overwrite each other.
+Distributed Reptile run names also include global meta-batch size and world
+size. Use `--checkpoint_path` to test a checkpoint with a different number of
+GPUs from the training run.
 
 
 ### Command Line Arguments
@@ -124,6 +182,11 @@ experiments with different adaptation settings do not overwrite each other.
   - `--meta_lr`: Outer loop learning rate
   - `--inner_lr`: Inner loop learning rate
   - `--num_epochs`: Number of training epochs
+  - `--meta_batch_size`: Global Reptile task count per outer update
+  - `--eval_batch_size`: Per-process validation loader batch size
+  - `--num_workers`: Data loader worker count per process
+  - `--distributed_backend`: Distributed backend, normally `nccl`
+  - `--checkpoint_path`: Explicit checkpoint path for test mode
   - `--seed`: Random seed for task and support-set shuffling
   - `--embedding_cache_dir`: Directory for persistent float32 ESM1v embeddings
   - `--embedding_memory_cache_size`: Maximum number of CPU embeddings kept in memory
