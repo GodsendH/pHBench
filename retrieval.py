@@ -55,6 +55,12 @@ def extract_and_save_features(fasta_file, output_file, tokenizer, model, device,
         records = parse_fasta_to_dict(fasta_file)
         return records, features
 
+    if tokenizer is None or model is None:
+        raise RuntimeError(
+            f"Feature cache is missing and cannot be generated: {output_file}. "
+            "An ESM2 model must be loaded first."
+        )
+
     records = parse_fasta_to_dict(fasta_file)
     sequences = [str(record['seq']) for record in records.values()]
     
@@ -363,7 +369,21 @@ def main():
     parser.add_argument("--topk", type=int, default=5, help="Number of similar sequences to retrieve")
     parser.add_argument("--batch_size", type=int, default=100, help="Size of batches for processing")
     parser.add_argument("--features_dir", default="data/features", help="Directory to save feature files")
-    parser.add_argument("--model_name", default="path_to/facebook/esm2_t33_650M_UR50D", help="Path to the ESM2 model")
+    parser.add_argument(
+        "--model_name",
+        default="facebook/esm2_t33_650M_UR50D",
+        help="Hugging Face model ID or path to a complete local model directory",
+    )
+    parser.add_argument(
+        "--model_cache_dir",
+        default=None,
+        help="Hugging Face cache root containing directories such as models--facebook--...",
+    )
+    parser.add_argument(
+        "--local_files_only",
+        action="store_true",
+        help="Load the model only from local files without contacting Hugging Face",
+    )
     parser.add_argument("--strategy", default="opt_retrieval", 
                        choices=["opt_retrieval", "opt_random", "opt_fixed_random",
                                "opt_retrieval_scaled_0.2","opt_retrieval_scaled_0.6"],  
@@ -377,12 +397,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
 
-    # Load ESM2 model and tokenizer
-    logging.info(f"Loading model: {args.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = AutoModel.from_pretrained(args.model_name).to(device)
-    logging.info("Model loaded successfully")
-
     logging.info("Starting main program execution")
     output_dir = os.path.join(args.output_dir, f"top{args.topk}", f"esm2_{args.strategy}")
     logging.info(f"Creating output directory: {output_dir}")
@@ -390,12 +404,45 @@ def main():
     logging.info(f"Creating features directory: {args.features_dir}")
     os.makedirs(args.features_dir, exist_ok=True)
 
-    
+    feature_files = {
+        "train": os.path.join(args.features_dir, "opt_train_features.pkl"),
+        "test": os.path.join(args.features_dir, "opt_test_features.pkl"),
+        "valid": os.path.join(args.features_dir, "opt_valid_features.pkl"),
+    }
+    missing_feature_files = [
+        path for path in feature_files.values() if not os.path.isfile(path)
+    ]
+
+    tokenizer = None
+    model = None
+    if missing_feature_files:
+        logging.info(
+            "Missing feature caches: %s",
+            ", ".join(missing_feature_files),
+        )
+        load_options = {
+            "cache_dir": args.model_cache_dir,
+            "local_files_only": args.local_files_only,
+        }
+        logging.info(
+            "Loading model: %s (cache_dir=%s, local_files_only=%s)",
+            args.model_name,
+            args.model_cache_dir,
+            args.local_files_only,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name, **load_options)
+        model = AutoModel.from_pretrained(args.model_name, **load_options).to(device)
+        logging.info("Model loaded successfully")
+    else:
+        logging.info(
+            "All feature caches are present; skipping ESM2 model loading."
+        )
+
     # 预加载训练集特征（用于opt策略）
     train_features = None
     train_records = None
 
-    train_features_file = os.path.join(args.features_dir, "opt_train_features.pkl")
+    train_features_file = feature_files["train"]
     train_records, train_features = extract_and_save_features(
         args.opt_train, 
         train_features_file, 
@@ -408,7 +455,7 @@ def main():
     # 处理每个数据集
     for dataset, opt_file in [("train", args.opt_train), ("test", args.opt_test), ("valid", args.opt_valid)]:
         output_json = os.path.join(output_dir, f"retrieval_{dataset}.json")
-        opt_features_file = os.path.join(args.features_dir, f"opt_{dataset}_features.pkl")
+        opt_features_file = feature_files[dataset]
         
         logging.info(f"Starting to process {dataset} dataset...")
         process_dataset(
