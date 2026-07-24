@@ -11,6 +11,7 @@ import argparse
 from torch.utils.tensorboard import SummaryWriter
 
 from models import pHPredictionModel, ProteinpHDataset, SupportDataset
+from dataset_config import add_dataset_argument, get_dataset_config
 from utils import (
     BaseTrainer,
     calculate_metrics,
@@ -161,8 +162,9 @@ class MAMLTrainer(BaseTrainer):
 def get_run_name(args):
     """Generate a unique run name containing key configuration parameters"""
     pretrained_int = 1 if args.pretrained else 0
+    dataset_suffix = '' if args.dataset == 'phopt' else f'_{args.dataset}'
     return (
-        f"maml_{args.retrieval_strategy}_topk{args.topk}"
+        f"maml{dataset_suffix}_{args.retrieval_strategy}_topk{args.topk}"
         f"_mlr{args.meta_lr}_ilr{args.inner_lr}_ep{args.num_epochs}"
         f"_ve{args.validate_every}_pr{pretrained_int}_pt{int(args.patience)}"
         f"_is{args.inner_steps}_sbs{args.support_batch_size}_seed{args.seed}"
@@ -170,6 +172,7 @@ def get_run_name(args):
 
 def main(args):
     seed_everything(args.seed)
+    dataset_config = get_dataset_config(args.dataset)
     run_name = get_run_name(args)
     args.save_dir = os.path.join(args.save_dir, run_name)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -178,11 +181,17 @@ def main(args):
     writer = SummaryWriter(log_dir=args.log_dir)
 
     # Load datasets
-    data_dir = os.path.join('data/processed', f'top{args.topk}', f'esm2_{args.retrieval_strategy}')
+    data_dir = dataset_config.retrieval_dir(
+        args.topk,
+        args.retrieval_strategy,
+    )
     train_dataset = ProteinpHDataset(os.path.join(data_dir, 'retrieval_train.json'))
     valid_dataset = ProteinpHDataset(os.path.join(data_dir, 'retrieval_valid.json'))
     if args.random_test:
-        test_dataset = ProteinpHDataset(os.path.join('data/processed/top5/esm2_opt_random', 'retrieval_test.json'))
+        random_test_dir = dataset_config.retrieval_dir(5, 'opt_random')
+        test_dataset = ProteinpHDataset(
+            os.path.join(random_test_dir, 'retrieval_test.json')
+        )
     else:
         test_dataset = ProteinpHDataset(os.path.join(data_dir, 'retrieval_test.json'))
 
@@ -199,7 +208,12 @@ def main(args):
     test_loader = DataLoader(test_dataset, batch_size=10, shuffle=False, collate_fn=lambda x: x)
     
     # Initialize model and trainer
-    embedding_cache_dir = None if args.disable_embedding_cache else args.embedding_cache_dir
+    embedding_cache_dir = None
+    if not args.disable_embedding_cache:
+        embedding_cache_dir = args.embedding_cache_dir or os.path.join(
+            dataset_config.features_dir,
+            'esm1v_t33_650M_UR90S_1',
+        )
     model = pHPredictionModel(
         pretrained=args.pretrained,
         embedding_cache_dir=embedding_cache_dir,
@@ -240,6 +254,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MAML pH Prediction Model")
+    add_dataset_argument(parser)
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
     parser.add_argument('--pretrained', action='store_true')
     parser.add_argument('--meta_lr', type=float, default=0.0001)
@@ -258,7 +273,8 @@ if __name__ == "__main__":
     parser.add_argument(
         '--embedding_cache_dir',
         type=str,
-        default='./data/features/esm1v_t33_650M_UR90S_1',
+        default=None,
+        help='Override the selected dataset embedding-cache directory',
     )
     parser.add_argument('--embedding_memory_cache_size', type=int, default=256)
     parser.add_argument('--disable_embedding_cache', action='store_true')

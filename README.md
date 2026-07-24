@@ -43,14 +43,17 @@ Prepare sequence retrieval data using different strategies:
 
 ```bash
 python retrieval.py \
-    --opt_train data/phopt_training.fasta \
-    --opt_test data/phopt_testing.fasta \
-    --opt_valid data/phopt_validation.fasta \
+    --dataset phopt \
     --model_name facebook/esm2_t33_650M_UR50D \
-    --features_dir data/features \
     --strategy opt_retrieval \
     --topk 5
 ```
+
+Use `--dataset dedup` to prepare `dedup_data/dedup/{train,val,test}.fasta`.
+Dataset-specific features and retrieval JSON files are written under
+`data/` for `phopt` and `dedup_data/` for `dedup`. The FASTA, features, and
+output directories can still be overridden with `--opt_train`, `--opt_valid`,
+`--opt_test`, `--features_dir`, and `--output_dir`.
 
 ### Model Training
 
@@ -62,6 +65,7 @@ Train the model using Model-Agnostic Meta-Learning:
 export LD_LIBRARY_PATH=/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
 python maml.py \
+    --dataset phopt \
     --mode train \
     --num_epochs 50 \
     --retrieval_strategy opt_retrieval \
@@ -81,6 +85,7 @@ Train the model on one GPU using the Reptile algorithm:
 
 ```bash
 python reptile.py \
+    --dataset phopt \
     --mode train \
     --num_epochs 50 \
     --retrieval_strategy opt_retrieval \
@@ -113,6 +118,7 @@ torchrun \
     --nnodes=1 \
     --nproc_per_node=2 \
     reptile.py \
+    --dataset phopt \
     --mode train \
     --num_epochs 50 \
     --retrieval_strategy opt_retrieval \
@@ -149,10 +155,11 @@ task adapts from the same base parameters, task deltas are averaged globally,
 and one outer update is applied. This replaces the old sequential behavior
 where each task updated the base model before the next task.
 
-The frozen ESM1v representations are cached lazily as float32 tensors in
-`data/features/esm1v_t33_650M_UR90S_1`. The first encounter of a sequence
-creates its cache file; later inner-loop steps, validation runs, and epochs
-reuse it. Use `--embedding_cache_dir` to choose another location,
+The frozen ESM1v representations are cached lazily as float32 tensors in the
+selected dataset's feature directory (`data/features` for `phopt` and
+`dedup_data/features` for `dedup`). The first encounter of a sequence creates
+its cache file; later inner-loop steps, validation runs, and epochs reuse it.
+Use `--embedding_cache_dir` to choose another location,
 `--embedding_memory_cache_size` to control the in-memory LRU size, or
 `--disable_embedding_cache` to run the original uncached forward path.
 
@@ -166,6 +173,7 @@ GPUs from the training run.
 ### Command Line Arguments
 
 - **Mode Options**:
+  - `--dataset`: Select `phopt` (default) or `dedup`
   - `--mode`: train or test
   - `--pretrained`: Use pretrained EpHod RLAT weights; ESM1v is always pretrained
 

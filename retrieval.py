@@ -11,6 +11,8 @@ import argparse
 import logging
 from collections import defaultdict
 
+from dataset_config import add_dataset_argument, get_dataset_config
+
 def encode_sequences_batch(sequences, tokenizer, model, device, batch_size=32):
     """Encode sequences in batches"""
     all_embeddings = []
@@ -196,7 +198,7 @@ def opt_random_retrieval(opt_features, opt_records, train_features=None, train_r
     logging.info(f"OPT random retrieval completed for {dataset_type} dataset")
     return results
 
-def opt_fixed_random_retrieval(opt_features, opt_records, train_features=None, train_records=None, k=5, dataset_type="train"):
+def opt_fixed_random_retrieval(opt_features, opt_records, train_features=None, train_records=None, k=5, dataset_type="train", cache_dir="data"):
     """为所有opt选择相同的k个随机训练集序列
     
     Args:
@@ -221,7 +223,7 @@ def opt_fixed_random_retrieval(opt_features, opt_records, train_features=None, t
     np.random.seed(42)
     
     # 检查固定source keys的缓存文件是否存在
-    cache_file = "data/fixed_random_opt_keys.json"
+    cache_file = os.path.join(cache_dir, "fixed_random_opt_keys.json")
     if dataset_type == "train" or not os.path.exists(cache_file):
         # 只在训练集处理时或缓存不存在时生成新的随机选择
         fixed_source_keys = np.random.choice(source_keys, size=k, replace=False).tolist()
@@ -257,7 +259,7 @@ def opt_fixed_random_retrieval(opt_features, opt_records, train_features=None, t
     logging.info(f"OPT fixed random retrieval completed for {dataset_type} dataset")
     return results
 
-def opt_retrieval_scaled(opt_features, opt_records, train_features=None, train_records=None, k=5, dataset_type="train", scale_ratio=1.0):
+def opt_retrieval_scaled(opt_features, opt_records, train_features=None, train_records=None, k=5, dataset_type="train", scale_ratio=1.0, cache_dir="data"):
     """从缩小规模后的opt训练集中检索序列,只缩小训练集规模"""
     logging.info(f"Starting scaled OPT retrieval for {dataset_type} dataset with {scale_ratio*100}% training data")
     opt_keys = list(opt_features.keys())
@@ -276,7 +278,11 @@ def opt_retrieval_scaled(opt_features, opt_records, train_features=None, train_r
         source_keys = selected_opt_keys
         
         # 保存缩小后的训练集keys供验证集和测试集使用
-        cache_file = f"data/scaled_cache/scaled_train_keys_{scale_ratio}.json"
+        cache_file = os.path.join(
+            cache_dir,
+            "scaled_cache",
+            f"scaled_train_keys_{scale_ratio}.json",
+        )
         os.makedirs(os.path.dirname(cache_file), exist_ok=True)
         with open(cache_file, 'w') as f:
             json.dump(source_keys, f)
@@ -286,7 +292,11 @@ def opt_retrieval_scaled(opt_features, opt_records, train_features=None, train_r
         selected_opt_records = opt_records
         selected_opt_keys = opt_keys
         
-        cache_file = f"data/scaled_cache/scaled_train_keys_{scale_ratio}.json"
+        cache_file = os.path.join(
+            cache_dir,
+            "scaled_cache",
+            f"scaled_train_keys_{scale_ratio}.json",
+        )
         with open(cache_file, 'r') as f:
             source_keys = json.load(f)
             source_features = {k: train_features[k] for k in source_keys}
@@ -326,7 +336,7 @@ def opt_retrieval_scaled(opt_features, opt_records, train_features=None, train_r
 def process_dataset(opt_file,  output_json, tokenizer, model, device, topk=5, 
                    batch_size=100, opt_features_file=None, 
                    strategy=None, dataset_type=None,
-                   train_features=None, train_records=None):
+                   train_features=None, train_records=None, cache_dir="data"):
     """Process dataset"""
     logging.info(f"Starting to process dataset: {opt_file}")
     opt_records, opt_features = extract_and_save_features(
@@ -346,11 +356,28 @@ def process_dataset(opt_file,  output_json, tokenizer, model, device, topk=5,
     elif strategy == "opt_random":
         results = opt_random_retrieval(opt_features, opt_records, train_features, train_records, topk, dataset_type)
     elif strategy == "opt_fixed_random":
-        results = opt_fixed_random_retrieval(opt_features, opt_records, train_features, train_records, topk, dataset_type)
+        results = opt_fixed_random_retrieval(
+            opt_features,
+            opt_records,
+            train_features,
+            train_records,
+            topk,
+            dataset_type,
+            cache_dir,
+        )
     elif strategy.startswith("opt_retrieval_scaled"):
     # 从策略名称中提取比例，例如 "opt_retrieval_scaled_0.2" 表示使用20%的数据
         scale_ratio = float(strategy.split("_")[-1])
-        results = opt_retrieval_scaled(opt_features, opt_records, train_features, train_records, topk, dataset_type, scale_ratio)
+        results = opt_retrieval_scaled(
+            opt_features,
+            opt_records,
+            train_features,
+            train_records,
+            topk,
+            dataset_type,
+            scale_ratio,
+            cache_dir,
+        )
     else:
         raise ValueError(f"Unknown retrieval strategy: {strategy}")
 
@@ -362,13 +389,14 @@ def process_dataset(opt_file,  output_json, tokenizer, model, device, topk=5,
 
 def main():
     parser = argparse.ArgumentParser(description="Process protein sequences and find similar environmental sequences.")
-    parser.add_argument("--opt_train", default="data/phopt_training.fasta", help="Path to the OPT training FASTA file")
-    parser.add_argument("--opt_test", default="data/phopt_testing.fasta", help="Path to the OPT testing FASTA file")
-    parser.add_argument("--opt_valid", default="data/phopt_validation.fasta", help="Path to the OPT validation FASTA file")
-    parser.add_argument("--output_dir", default="data/processed", help="Base directory to save output JSON files")
+    add_dataset_argument(parser)
+    parser.add_argument("--opt_train", help="Override the selected dataset's training FASTA file")
+    parser.add_argument("--opt_test", help="Override the selected dataset's testing FASTA file")
+    parser.add_argument("--opt_valid", help="Override the selected dataset's validation FASTA file")
+    parser.add_argument("--output_dir", help="Override the selected dataset's processed-data directory")
     parser.add_argument("--topk", type=int, default=5, help="Number of similar sequences to retrieve")
     parser.add_argument("--batch_size", type=int, default=100, help="Size of batches for processing")
-    parser.add_argument("--features_dir", default="data/features", help="Directory to save feature files")
+    parser.add_argument("--features_dir", help="Override the selected dataset's feature-cache directory")
     parser.add_argument(
         "--model_name",
         default="facebook/esm2_t33_650M_UR50D",
@@ -390,6 +418,15 @@ def main():
                                 help="Retrieval strategy to use")
     args = parser.parse_args()
 
+    dataset_config = get_dataset_config(args.dataset)
+    fasta_files = {
+        "train": args.opt_train or dataset_config.fasta_files["train"],
+        "test": args.opt_test or dataset_config.fasta_files["test"],
+        "valid": args.opt_valid or dataset_config.fasta_files["valid"],
+    }
+    output_root = args.output_dir or dataset_config.processed_dir
+    features_dir = args.features_dir or dataset_config.features_dir
+
     # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -398,16 +435,16 @@ def main():
     logging.info(f"Using device: {device}")
 
     logging.info("Starting main program execution")
-    output_dir = os.path.join(args.output_dir, f"top{args.topk}", f"esm2_{args.strategy}")
+    output_dir = os.path.join(output_root, f"top{args.topk}", f"esm2_{args.strategy}")
     logging.info(f"Creating output directory: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
-    logging.info(f"Creating features directory: {args.features_dir}")
-    os.makedirs(args.features_dir, exist_ok=True)
+    logging.info(f"Creating features directory: {features_dir}")
+    os.makedirs(features_dir, exist_ok=True)
 
     feature_files = {
-        "train": os.path.join(args.features_dir, "opt_train_features.pkl"),
-        "test": os.path.join(args.features_dir, "opt_test_features.pkl"),
-        "valid": os.path.join(args.features_dir, "opt_valid_features.pkl"),
+        "train": os.path.join(features_dir, "opt_train_features.pkl"),
+        "test": os.path.join(features_dir, "opt_test_features.pkl"),
+        "valid": os.path.join(features_dir, "opt_valid_features.pkl"),
     }
     missing_feature_files = [
         path for path in feature_files.values() if not os.path.isfile(path)
@@ -444,7 +481,7 @@ def main():
 
     train_features_file = feature_files["train"]
     train_records, train_features = extract_and_save_features(
-        args.opt_train, 
+        fasta_files["train"],
         train_features_file, 
         tokenizer, 
         model, 
@@ -453,7 +490,7 @@ def main():
     )
 
     # 处理每个数据集
-    for dataset, opt_file in [("train", args.opt_train), ("test", args.opt_test), ("valid", args.opt_valid)]:
+    for dataset, opt_file in fasta_files.items():
         output_json = os.path.join(output_dir, f"retrieval_{dataset}.json")
         opt_features_file = feature_files[dataset]
         
@@ -471,7 +508,8 @@ def main():
             # args.lambda_param,
             dataset_type=dataset,
             train_features=train_features,
-            train_records=train_records
+            train_records=train_records,
+            cache_dir=dataset_config.data_root,
         )
     
     logging.info("All datasets processed and saved.")
