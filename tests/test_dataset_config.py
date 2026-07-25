@@ -36,6 +36,32 @@ class DatasetConfigTests(unittest.TestCase):
         self.assertEqual(parser.parse_args([]).dataset, 'phopt')
         self.assertEqual(parser.parse_args(['--dataset', 'dedup']).dataset, 'dedup')
 
+    def test_homology_dataset_paths(self):
+        config = get_dataset_config('homology50')
+
+        self.assertEqual(
+            config.fasta_files['train'],
+            'homology_data/identity50/train.fasta',
+        )
+        self.assertEqual(
+            config.fasta_files['valid'],
+            'homology_data/identity50/valid.fasta',
+        )
+        self.assertEqual(
+            config.retrieval_dir(5, 'opt_retrieval'),
+            'homology_data/identity50/processed/top5/esm2_opt_retrieval',
+        )
+
+    def test_dataset_argument_accepts_homology_levels(self):
+        parser = argparse.ArgumentParser()
+        add_dataset_argument(parser)
+
+        for level in (100, 90, 70, 50, 30):
+            self.assertEqual(
+                parser.parse_args(['--dataset', f'homology{level}']).dataset,
+                f'homology{level}',
+            )
+
 
 if __name__ == '__main__':
     unittest.main()

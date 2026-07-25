@@ -1,0 +1,675 @@
+{
+  "cleaning": {
+    "cleaned_sequences": 9733,
+    "conflicting_groups_removed": 41,
+    "conflicting_records_removed": 85,
+    "input_records": 9855,
+    "input_unique_sequences": 9774,
+    "same_label_duplicate_extra_records_removed": 37,
+    "same_label_duplicate_groups": 30
+  },
+  "command": [
+    "build_homology_ladder.py",
+    "--output-root",
+    "homology_data",
+    "--thresholds",
+    "100",
+    "90",
+    "70",
+    "50",
+    "30",
+    "--coverage",
+    "0.8",
+    "--sensitivity",
+    "7.5",
+    "--ph-bin-width",
+    "0.5",
+    "--split-attempts",
+    "64",
+    "--seed",
+    "0",
+    "--threads",
+    "18",
+    "--mmseqs",
+    "/tmp/phbench-mmseqs-build/mmseqs/bin/mmseqs"
+  ],
+  "coverage": 0.8,
+  "levels": {
+    "homology100": {
+      "alignment_mode": 3,
+      "alignment_rows": 0,
+      "cluster_statistics": {
+        "count": 9733,
+        "max_size": 1,
+        "median_size": 1,
+        "singletons": 9733
+      },
+      "coverage": 0.8,
+      "coverage_mode": 0,
+      "cross_split_edges_at_threshold": 0,
+      "dataset": "homology100",
+      "files": {
+        "assignments.tsv": "66225dd904ad603697865ba6d15a6687b6d90edf32b04a3153c35dbca6dcc937",
+        "clusters.tsv": "06791b1080a31e09f7f4630562cbaee6e203dc6aa9e89a8ef9d058babc005e3e",
+        "test.fasta": "8758d82b19447ca5eef9585f458ee10a29bce1bd12a7bbfd56c1b370ae33b808",
+        "train.fasta": "31214069e266ec7cc3ac6db3baf298af0d7314085631ce739af8abb191d673a7",
+        "valid.fasta": "91401bd8d26416abb920386d2596585e62d869a61fa4b95ee15e115b580aa32f"
+      },
+      "identity_threshold_percent": 100,
+      "max_seqs": 10000,
+      "method": "MMseqs2 all-vs-all edges plus connected components",
+      "mmseqs_command": null,
+      "sensitivity": 7.5,
+      "split_optimization": {
+        "actual_counts": {
+          "test": 1947,
+          "train": 7036,
+          "valid": 750
+        },
+        "score": 1.2318376973846852,
+        "selected_attempt": 25,
+        "selected_seed": 25,
+        "target_counts": {
+          "test": 1946.6000000000001,
+          "train": 7035.808422120751,
+          "valid": 750.591577879249
+        }
+      },
+      "splits": {
+        "test": {
+          "count": 1947,
+          "ec_class_counts": {
+            "1": 424,
+            "2": 505,
+            "3": 650,
+            "4": 187,
+            "5": 95,
+            "6": 66,
+            "7": 20
+          },
+          "length_max": 1020,
+          "length_mean": 426.13713405238826,
+          "length_median": 392,
+          "ph_max": 12.0,
+          "ph_mean": 7.225110426296867,
+          "ph_min": 1.8,
+          "ph_population_sd": 1.1511172419007119
+        },
+        "train": {
+          "count": 7036,
+          "ec_class_counts": {
+            "1": 1536,
+            "2": 1822,
+            "3": 2349,
+            "4": 675,
+            "5": 342,
+            "6": 239,
+            "7": 73
+          },
+          "length_max": 1021,
+          "length_mean": 428.32959067652075,
+          "length_median": 397.0,
+          "ph_max": 12.0,
+          "ph_mean": 7.221900227401933,
+          "ph_min": 1.0,
+          "ph_population_sd": 1.1505191806989952
+        },
+        "valid": {
+          "count": 750,
+          "ec_class_counts": {
+            "1": 164,
+            "2": 194,
+            "3": 250,
+            "4": 72,
+            "5": 36,
+            "6": 26,
+            "7": 8
+          },
+          "length_max": 999,
+          "length_mean": 428.74533333333335,
+          "length_median": 406.0,
+          "ph_max": 11.0,
+          "ph_mean": 7.22144,
+          "ph_min": 2.0,
+          "ph_population_sd": 1.124454383126916
+        }
+      }
+    },
+    "homology30": {
+      "alignment_mode": 3,
+      "alignment_rows": 74682,
+      "cluster_statistics": {
+        "count": 3902,
+        "max_size": 81,
+        "median_size": 1.0,
+        "singletons": 2483
+      },
+      "coverage": 0.8,
+      "coverage_mode": 0,
+      "cross_split_edges_at_threshold": 0,
+      "dataset": "homology30",
+      "files": {
+        "assignments.tsv": "1f6c4718ffdd66ae08cfac4288350306cd7d94d850fc41a76da2b8f5f69eabe1",
+        "clusters.tsv": "f13bd7ef38d87586498392fe1cf3c0c185bf237633845ace4980e4de8140e8b5",
+        "test.fasta": "2a2dcb9a2e59ac81f165b9cf6377b2020734ab6c0b7e921d28e8206b83a6c75f",
+        "train.fasta": "eeb692df1200dd2f1c603d5d5c234d7918808dcae7e55a6e9a1db42ad20962e2",
+        "valid.fasta": "b05b9c6f5e26ecd21bf3382b577a9de156e5a8185d58612f97073455cd5d42d4"
+      },
+      "identity_threshold_percent": 30,
+      "max_seqs": 10000,
+      "method": "MMseqs2 all-vs-all edges plus connected components",
+      "mmseqs_command": [
+        "/tmp/phbench-mmseqs-build/mmseqs/bin/mmseqs",
+        "easy-search",
+        ".homology_data.building-vt6lafvh/.work/cleaned.fasta",
+        ".homology_data.building-vt6lafvh/.work/cleaned.fasta",
+        ".homology_data.building-vt6lafvh/.work/identity30_edges.tsv",
+        ".homology_data.building-vt6lafvh/.work/tmp_identity30",
+        "--min-seq-id",
+        "0.300000",
+        "-c",
+        "0.800000",
+        "--cov-mode",
+        "0",
+        "--alignment-mode",
+        "3",
+        "--max-seqs",
+        "10000",
+        "-s",
+        "7.5",
+        "--format-output",
+        "query,target,fident,qcov,tcov",
+        "--threads",
+        "18",
+        "-v",
+        "1"
+      ],
+      "sensitivity": 7.5,
+      "split_optimization": {
+        "actual_counts": {
+          "test": 1947,
+          "train": 7036,
+          "valid": 750
+        },
+        "score": 1.2346148280965838,
+        "selected_attempt": 23,
+        "selected_seed": 23,
+        "target_counts": {
+          "test": 1946.6000000000001,
+          "train": 7035.808422120751,
+          "valid": 750.591577879249
+        }
+      },
+      "splits": {
+        "test": {
+          "count": 1947,
+          "ec_class_counts": {
+            "1": 425,
+            "2": 504,
+            "3": 651,
+            "4": 187,
+            "5": 94,
+            "6": 66,
+            "7": 20
+          },
+          "length_max": 1019,
+          "length_mean": 432.96045197740114,
+          "length_median": 411,
+          "ph_max": 12.0,
+          "ph_mean": 7.224982023626092,
+          "ph_min": 1.8,
+          "ph_population_sd": 1.1499185729352857
+        },
+        "train": {
+          "count": 7036,
+          "ec_class_counts": {
+            "1": 1535,
+            "2": 1823,
+            "3": 2348,
+            "4": 675,
+            "5": 342,
+            "6": 240,
+            "7": 73
+          },
+          "length_max": 1021,
+          "length_mean": 426.4275156338829,
+          "length_median": 392.0,
+          "ph_max": 12.0,
+          "ph_mean": 7.221374360432063,
+          "ph_min": 1.0,
+          "ph_population_sd": 1.1502843414658486
+        },
+        "valid": {
+          "count": 750,
+          "ec_class_counts": {
+            "1": 164,
+            "2": 194,
+            "3": 250,
+            "4": 72,
+            "5": 37,
+            "6": 25,
+            "7": 8
+          },
+          "length_max": 1014,
+          "length_mean": 428.876,
+          "length_median": 397.0,
+          "ph_max": 11.0,
+          "ph_mean": 7.226706666666666,
+          "ph_min": 2.0,
+          "ph_population_sd": 1.1298687625659107
+        }
+      }
+    },
+    "homology50": {
+      "alignment_mode": 3,
+      "alignment_rows": 30676,
+      "cluster_statistics": {
+        "count": 6181,
+        "max_size": 40,
+        "median_size": 1,
+        "singletons": 4709
+      },
+      "coverage": 0.8,
+      "coverage_mode": 0,
+      "cross_split_edges_at_threshold": 0,
+      "dataset": "homology50",
+      "files": {
+        "assignments.tsv": "825033c5c8eb9c510970fa2c240dadccbf22460e711ea75e461de101f5ba414f",
+        "clusters.tsv": "685135ac26469316716b3050b5e6f8e453f48c3f16d803e63277d6edc80f148f",
+        "test.fasta": "4b4c3e26a2bfecc28c21930d739c38722a0b89e4df43b4c8f6bacbc4b8c83f74",
+        "train.fasta": "1513eb55d6b496b577e46c35f777b7f5a58655f2cb24f7173278f01f9cc50a7a",
+        "valid.fasta": "922739d7d0f8f0bbb79d99cab7d31bb312211d619e324b4d06b1aa5ca52d3c75"
+      },
+      "identity_threshold_percent": 50,
+      "max_seqs": 10000,
+      "method": "MMseqs2 all-vs-all edges plus connected components",
+      "mmseqs_command": [
+        "/tmp/phbench-mmseqs-build/mmseqs/bin/mmseqs",
+        "easy-search",
+        ".homology_data.building-vt6lafvh/.work/cleaned.fasta",
+        ".homology_data.building-vt6lafvh/.work/cleaned.fasta",
+        ".homology_data.building-vt6lafvh/.work/identity50_edges.tsv",
+        ".homology_data.building-vt6lafvh/.work/tmp_identity50",
+        "--min-seq-id",
+        "0.500000",
+        "-c",
+        "0.800000",
+        "--cov-mode",
+        "0",
+        "--alignment-mode",
+        "3",
+        "--max-seqs",
+        "10000",
+        "-s",
+        "7.5",
+        "--format-output",
+        "query,target,fident,qcov,tcov",
+        "--threads",
+        "18",
+        "-v",
+        "1"
+      ],
+      "sensitivity": 7.5,
+      "split_optimization": {
+        "actual_counts": {
+          "test": 1947,
+          "train": 7036,
+          "valid": 750
+        },
+        "score": 1.2319908707486658,
+        "selected_attempt": 55,
+        "selected_seed": 55,
+        "target_counts": {
+          "test": 1946.6000000000001,
+          "train": 7035.808422120751,
+          "valid": 750.591577879249
+        }
+      },
+      "splits": {
+        "test": {
+          "count": 1947,
+          "ec_class_counts": {
+            "1": 425,
+            "2": 503,
+            "3": 651,
+            "4": 187,
+            "5": 95,
+            "6": 66,
+            "7": 20
+          },
+          "length_max": 1014,
+          "length_mean": 430.8156137647663,
+          "length_median": 401,
+          "ph_max": 12.0,
+          "ph_mean": 7.226702619414484,
+          "ph_min": 1.8,
+          "ph_population_sd": 1.1499071289215725
+        },
+        "train": {
+          "count": 7036,
+          "ec_class_counts": {
+            "1": 1535,
+            "2": 1824,
+            "3": 2348,
+            "4": 675,
+            "5": 342,
+            "6": 239,
+            "7": 73
+          },
+          "length_max": 1021,
+          "length_mean": 427.65676520750424,
+          "length_median": 397.0,
+          "ph_max": 12.0,
+          "ph_mean": 7.222144684479819,
+          "ph_min": 1.0,
+          "ph_population_sd": 1.1506782942115672
+        },
+        "valid": {
+          "count": 750,
+          "ec_class_counts": {
+            "1": 164,
+            "2": 194,
+            "3": 250,
+            "4": 72,
+            "5": 36,
+            "6": 26,
+            "7": 8
+          },
+          "length_max": 975,
+          "length_mean": 422.912,
+          "length_median": 379.0,
+          "ph_max": 11.0,
+          "ph_mean": 7.215013333333333,
+          "ph_min": 2.4,
+          "ph_population_sd": 1.126104050767759
+        }
+      }
+    },
+    "homology70": {
+      "alignment_mode": 3,
+      "alignment_rows": 17754,
+      "cluster_statistics": {
+        "count": 7812,
+        "max_size": 22,
+        "median_size": 1.0,
+        "singletons": 6752
+      },
+      "coverage": 0.8,
+      "coverage_mode": 0,
+      "cross_split_edges_at_threshold": 0,
+      "dataset": "homology70",
+      "files": {
+        "assignments.tsv": "00d71747b0b6af7c996bdead2a6b4ea309245a7ee4822611b52722f83035c0fb",
+        "clusters.tsv": "bd0c34d650c6421a6eb2da5414a771e48d100a279caf25b12fb1487978a73bdf",
+        "test.fasta": "cd13afe988051cb0665ca0eb159bbe23ee47ed43a07a3a44638f4d548023c775",
+        "train.fasta": "713c50968645273da6766d4618151d9e19197859070d16af032d13a779e25986",
+        "valid.fasta": "4791835db2405015e74fb1fa769ec8a46b45ddfb1ea5f8a749ebd86286901465"
+      },
+      "identity_threshold_percent": 70,
+      "max_seqs": 10000,
+      "method": "MMseqs2 all-vs-all edges plus connected components",
+      "mmseqs_command": [
+        "/tmp/phbench-mmseqs-build/mmseqs/bin/mmseqs",
+        "easy-search",
+        ".homology_data.building-vt6lafvh/.work/cleaned.fasta",
+        ".homology_data.building-vt6lafvh/.work/cleaned.fasta",
+        ".homology_data.building-vt6lafvh/.work/identity70_edges.tsv",
+        ".homology_data.building-vt6lafvh/.work/tmp_identity70",
+        "--min-seq-id",
+        "0.700000",
+        "-c",
+        "0.800000",
+        "--cov-mode",
+        "0",
+        "--alignment-mode",
+        "3",
+        "--max-seqs",
+        "10000",
+        "-s",
+        "7.5",
+        "--format-output",
+        "query,target,fident,qcov,tcov",
+        "--threads",
+        "18",
+        "-v",
+        "1"
+      ],
+      "sensitivity": 7.5,
+      "split_optimization": {
+        "actual_counts": {
+          "test": 1947,
+          "train": 7036,
+          "valid": 750
+        },
+        "score": 1.2357197038369214,
+        "selected_attempt": 15,
+        "selected_seed": 15,
+        "target_counts": {
+          "test": 1946.6000000000001,
+          "train": 7035.808422120751,
+          "valid": 750.591577879249
+        }
+      },
+      "splits": {
+        "test": {
+          "count": 1947,
+          "ec_class_counts": {
+            "1": 425,
+            "2": 505,
+            "3": 650,
+            "4": 187,
+            "5": 94,
+            "6": 66,
+            "7": 20
+          },
+          "length_max": 1020,
+          "length_mean": 429.39804827940424,
+          "length_median": 395,
+          "ph_max": 12.0,
+          "ph_mean": 7.22638418079096,
+          "ph_min": 1.5,
+          "ph_population_sd": 1.1550769878162337
+        },
+        "train": {
+          "count": 7036,
+          "ec_class_counts": {
+            "1": 1535,
+            "2": 1822,
+            "3": 2348,
+            "4": 675,
+            "5": 343,
+            "6": 240,
+            "7": 73
+          },
+          "length_max": 1021,
+          "length_mean": 427.5002842524161,
+          "length_median": 398.0,
+          "ph_max": 12.0,
+          "ph_mean": 7.219565093803298,
+          "ph_min": 1.0,
+          "ph_population_sd": 1.1498610335238677
+        },
+        "valid": {
+          "count": 750,
+          "ec_class_counts": {
+            "1": 164,
+            "2": 194,
+            "3": 251,
+            "4": 72,
+            "5": 36,
+            "6": 25,
+            "7": 8
+          },
+          "length_max": 1010,
+          "length_mean": 428.06,
+          "length_median": 391.0,
+          "ph_max": 11.0,
+          "ph_mean": 7.24004,
+          "ph_min": 2.4,
+          "ph_population_sd": 1.120039700963021
+        }
+      }
+    },
+    "homology90": {
+      "alignment_mode": 3,
+      "alignment_rows": 11810,
+      "cluster_statistics": {
+        "count": 9012,
+        "max_size": 11,
+        "median_size": 1.0,
+        "singletons": 8476
+      },
+      "coverage": 0.8,
+      "coverage_mode": 0,
+      "cross_split_edges_at_threshold": 0,
+      "dataset": "homology90",
+      "files": {
+        "assignments.tsv": "be0867633703639655ea961b0897003b249acea8b04888c7d06d220028ecfcd0",
+        "clusters.tsv": "ce7e000e618a9c5fff13fa21a967b3c95e3c3791763748b9a745bd1e945e1963",
+        "test.fasta": "83aa8f0567ae94bfc211059374f51bdb7fc0c9d6b28f4ae2cd81a05adb730989",
+        "train.fasta": "073e07f4247bd4beea21cdbedb42d51087a7e268b01c421e2978a8ff17b415fe",
+        "valid.fasta": "815d7ba5c4fa6241c036bee783ecfeaf6c7aee86b0d1d989b39011aba4549bea"
+      },
+      "identity_threshold_percent": 90,
+      "max_seqs": 10000,
+      "method": "MMseqs2 all-vs-all edges plus connected components",
+      "mmseqs_command": [
+        "/tmp/phbench-mmseqs-build/mmseqs/bin/mmseqs",
+        "easy-search",
+        ".homology_data.building-vt6lafvh/.work/cleaned.fasta",
+        ".homology_data.building-vt6lafvh/.work/cleaned.fasta",
+        ".homology_data.building-vt6lafvh/.work/identity90_edges.tsv",
+        ".homology_data.building-vt6lafvh/.work/tmp_identity90",
+        "--min-seq-id",
+        "0.900000",
+        "-c",
+        "0.800000",
+        "--cov-mode",
+        "0",
+        "--alignment-mode",
+        "3",
+        "--max-seqs",
+        "10000",
+        "-s",
+        "7.5",
+        "--format-output",
+        "query,target,fident,qcov,tcov",
+        "--threads",
+        "18",
+        "-v",
+        "1"
+      ],
+      "sensitivity": 7.5,
+      "split_optimization": {
+        "actual_counts": {
+          "test": 1947,
+          "train": 7036,
+          "valid": 750
+        },
+        "score": 1.2287509645794752,
+        "selected_attempt": 53,
+        "selected_seed": 53,
+        "target_counts": {
+          "test": 1946.6000000000001,
+          "train": 7035.808422120751,
+          "valid": 750.591577879249
+        }
+      },
+      "splits": {
+        "test": {
+          "count": 1947,
+          "ec_class_counts": {
+            "1": 425,
+            "2": 504,
+            "3": 650,
+            "4": 187,
+            "5": 95,
+            "6": 66,
+            "7": 20
+          },
+          "length_max": 1010,
+          "length_mean": 424.98818695428866,
+          "length_median": 391,
+          "ph_max": 12.0,
+          "ph_mean": 7.225947611710324,
+          "ph_min": 1.7,
+          "ph_population_sd": 1.1516044783268748
+        },
+        "train": {
+          "count": 7036,
+          "ec_class_counts": {
+            "1": 1535,
+            "2": 1823,
+            "3": 2349,
+            "4": 675,
+            "5": 342,
+            "6": 239,
+            "7": 73
+          },
+          "length_max": 1021,
+          "length_mean": 428.7445992040932,
+          "length_median": 397.0,
+          "ph_max": 12.0,
+          "ph_mean": 7.2208797612279705,
+          "ph_min": 1.0,
+          "ph_population_sd": 1.1507851618218816
+        },
+        "valid": {
+          "count": 750,
+          "ec_class_counts": {
+            "1": 164,
+            "2": 194,
+            "3": 250,
+            "4": 72,
+            "5": 36,
+            "6": 26,
+            "7": 8
+          },
+          "length_max": 1019,
+          "length_mean": 427.8346666666667,
+          "length_median": 403.0,
+          "ph_max": 11.0,
+          "ph_mean": 7.22884,
+          "ph_min": 2.4,
+          "ph_population_sd": 1.1205664584188362
+        }
+      }
+    }
+  },
+  "method": "global exact-sequence cleaning followed by threshold-specific MMseqs2 connected-component group splitting",
+  "mmseqs_version": "5d152c612b6ad2a56f657b7a02c127eceaea2a75",
+  "ph_bin_width": 0.5,
+  "schema_version": 1,
+  "seed": 0,
+  "source_files": {
+    "test": {
+      "path": "/home/hetianci/dproject/pHBench/data/phopt_testing.fasta",
+      "record_count": 1971,
+      "sha256": "ce370ce7e28bb980c54d95b0e047353161b14d372ec56ad66c66ad20d8e0b6db"
+    },
+    "train": {
+      "path": "/home/hetianci/dproject/pHBench/data/phopt_training.fasta",
+      "record_count": 7124,
+      "sha256": "b003e197e1fd3df782580022324b07ce2ce07cee543fdc643ea85a238490b769"
+    },
+    "valid": {
+      "path": "/home/hetianci/dproject/pHBench/data/phopt_validation.fasta",
+      "record_count": 760,
+      "sha256": "eac6456159826fcbc5fd1d5ebdaf6086eb47cb30d6214d218ae97ea107003bb3"
+    }
+  },
+  "split_attempts": 64,
+  "split_ratios": {
+    "test": 0.2,
+    "train": 0.7228817858954846,
+    "valid": 0.07711821410451547
+  },
+  "thresholds_percent": [
+    100,
+    90,
+    70,
+    50,
+    30
+  ],
+  "training_warning": "Do not use the EpHod supervised RLAT checkpoint pretrained on the original phopt split. Omit --pretrained for these datasets."
+}

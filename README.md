@@ -55,6 +55,62 @@ Dataset-specific features and retrieval JSON files are written under
 output directories can still be overridden with `--opt_train`, `--opt_valid`,
 `--opt_test`, `--features_dir`, and `--output_dir`.
 
+### Progressive Low-Homology Datasets
+
+Install MMseqs2 and build the 100%, 90%, 70%, 50%, and 30% identity levels:
+
+```bash
+conda install -c conda-forge -c bioconda mmseqs2
+
+python build_homology_ladder.py \
+    --train data/phopt_training.fasta \
+    --valid data/phopt_validation.fasta \
+    --test data/phopt_testing.fasta \
+    --output-root homology_data \
+    --thresholds 100 90 70 50 30 \
+    --coverage 0.8 \
+    --sensitivity 7.5 \
+    --threads "${SLURM_CPUS_PER_TASK:-1}"
+```
+
+The builder removes exact-sequence groups with conflicting pH labels and keeps
+one deterministic representative for same-label duplicates. For every identity
+level, it constructs the complete MMseqs2 homology graph, computes connected
+components, and assigns whole components to train, validation, or test. The
+split optimizer preserves the original 72.3%/7.7%/20.0% split ratio while
+matching pH bins, top-level EC classes, and sequence-length bins.
+
+Generated datasets are selected through the normal CLI:
+
+```bash
+python retrieval.py --dataset homology50 --strategy opt_retrieval --topk 5
+
+python reptile.py \
+    --dataset homology50 \
+    --mode train \
+    --num_epochs 50 \
+    --retrieval_strategy opt_retrieval \
+    --topk 5 \
+    --meta_lr 1 \
+    --inner_lr 0.001 \
+    --inner_steps 5 \
+    --meta_batch_size 5 \
+    --validate_every 200 \
+    --patience 5 \
+    --seed 0
+```
+
+Available names are `homology100`, `homology90`, `homology70`, `homology50`,
+and `homology30`. Do not add `--pretrained` for these datasets: the EpHod RLAT
+checkpoint was trained on the original phopt split and therefore contains
+supervised information from sequences reassigned to the new validation and test
+sets. ESM1v remains pretrained and frozen when `--pretrained` is omitted.
+
+Each level contains `train.fasta`, `valid.fasta`, `test.fasta`,
+`assignments.tsv`, `clusters.tsv`, and `manifest.json`. The manifest records the
+source hashes, MMseqs2 parameters, cluster statistics, split distributions, and
+the verified count of cross-split homology edges at that threshold.
+
 ### Model Training
 
 #### MAML Training
@@ -173,7 +229,8 @@ GPUs from the training run.
 ### Command Line Arguments
 
 - **Mode Options**:
-  - `--dataset`: Select `phopt` (default) or `dedup`
+  - `--dataset`: Select `phopt`, `dedup`, or one of
+    `homology{100,90,70,50,30}`
   - `--mode`: train or test
   - `--pretrained`: Use pretrained EpHod RLAT weights; ESM1v is always pretrained
 

@@ -1,0 +1,99 @@
+{
+  "alignment_mode": 3,
+  "alignment_rows": 0,
+  "cluster_statistics": {
+    "count": 9733,
+    "max_size": 1,
+    "median_size": 1,
+    "singletons": 9733
+  },
+  "coverage": 0.8,
+  "coverage_mode": 0,
+  "cross_split_edges_at_threshold": 0,
+  "dataset": "homology100",
+  "files": {
+    "assignments.tsv": "66225dd904ad603697865ba6d15a6687b6d90edf32b04a3153c35dbca6dcc937",
+    "clusters.tsv": "06791b1080a31e09f7f4630562cbaee6e203dc6aa9e89a8ef9d058babc005e3e",
+    "test.fasta": "8758d82b19447ca5eef9585f458ee10a29bce1bd12a7bbfd56c1b370ae33b808",
+    "train.fasta": "31214069e266ec7cc3ac6db3baf298af0d7314085631ce739af8abb191d673a7",
+    "valid.fasta": "91401bd8d26416abb920386d2596585e62d869a61fa4b95ee15e115b580aa32f"
+  },
+  "identity_threshold_percent": 100,
+  "max_seqs": 10000,
+  "method": "MMseqs2 all-vs-all edges plus connected components",
+  "sensitivity": 7.5,
+  "split_optimization": {
+    "actual_counts": {
+      "test": 1947,
+      "train": 7036,
+      "valid": 750
+    },
+    "score": 1.2318376973846852,
+    "selected_attempt": 25,
+    "selected_seed": 25,
+    "target_counts": {
+      "test": 1946.6000000000001,
+      "train": 7035.808422120751,
+      "valid": 750.591577879249
+    }
+  },
+  "splits": {
+    "test": {
+      "count": 1947,
+      "ec_class_counts": {
+        "1": 424,
+        "2": 505,
+        "3": 650,
+        "4": 187,
+        "5": 95,
+        "6": 66,
+        "7": 20
+      },
+      "length_max": 1020,
+      "length_mean": 426.13713405238826,
+      "length_median": 392,
+      "ph_max": 12.0,
+      "ph_mean": 7.225110426296867,
+      "ph_min": 1.8,
+      "ph_population_sd": 1.1511172419007119
+    },
+    "train": {
+      "count": 7036,
+      "ec_class_counts": {
+        "1": 1536,
+        "2": 1822,
+        "3": 2349,
+        "4": 675,
+        "5": 342,
+        "6": 239,
+        "7": 73
+      },
+      "length_max": 1021,
+      "length_mean": 428.32959067652075,
+      "length_median": 397.0,
+      "ph_max": 12.0,
+      "ph_mean": 7.221900227401933,
+      "ph_min": 1.0,
+      "ph_population_sd": 1.1505191806989952
+    },
+    "valid": {
+      "count": 750,
+      "ec_class_counts": {
+        "1": 164,
+        "2": 194,
+        "3": 250,
+        "4": 72,
+        "5": 36,
+        "6": 26,
+        "7": 8
+      },
+      "length_max": 999,
+      "length_mean": 428.74533333333335,
+      "length_median": 406.0,
+      "ph_max": 11.0,
+      "ph_mean": 7.22144,
+      "ph_min": 2.0,
+      "ph_population_sd": 1.124454383126916
+    }
+  }
+}
