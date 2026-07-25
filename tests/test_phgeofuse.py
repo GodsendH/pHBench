@@ -167,6 +167,27 @@ class PHGeoFuseTests(unittest.TestCase):
         self.assertTrue(any(parameter.grad is not None for parameter in model.parameters()))
         self.assertIn("ec", parts)
 
+    def test_loss_uses_final_fused_mse_as_primary_objective(self):
+        config = _tiny_config()
+        config["loss"].update(
+            {"mse_weight": 1.0, "distribution_weight": 0.0, "ec_weight": 0.0}
+        )
+        batch = {
+            "labels": torch.tensor([6.0, 8.0]),
+            "weights": torch.tensor([0.5, 3.0]),
+            "ec_labels": torch.tensor([-1, -1]),
+        }
+        outputs = {
+            "mean": torch.tensor([7.0, 6.0]),
+            "logits": torch.zeros(2, 5),
+            "ec_logits": torch.zeros(2, 7),
+        }
+
+        loss, parts = compute_loss(outputs, batch, config)
+
+        torch.testing.assert_close(loss, torch.tensor(2.5))
+        torch.testing.assert_close(parts["mse"], torch.tensor(2.5))
+
     def test_tiny_training_writes_reloadable_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -208,7 +229,12 @@ def _tiny_config():
         },
         "graph": {"rbf_bins": 4},
         "retrieval": {"dropout": 0.0},
-        "loss": {"soft_label_sigma": 0.35, "regression_weight": 0.5, "ec_weight": 0.1},
+        "loss": {
+            "soft_label_sigma": 0.35,
+            "mse_weight": 1.0,
+            "distribution_weight": 0.2,
+            "ec_weight": 0.1,
+        },
     }
 
 

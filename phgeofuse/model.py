@@ -238,17 +238,25 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, Any], config
     soft_targets = torch.exp(-0.5 * ((grid.unsqueeze(0) - labels.unsqueeze(-1)) / sigma).square())
     soft_targets = soft_targets / soft_targets.sum(dim=-1, keepdim=True)
     distribution_loss = -(soft_targets * F.log_softmax(outputs["logits"], dim=-1)).sum(dim=-1)
-    regression_loss = F.smooth_l1_loss(outputs["mean"], labels, reduction="none")
+    mse_loss = F.mse_loss(outputs["mean"], labels, reduction="none")
     weights = batch["weights"].clamp(
         float(get(config, "loss.min_sample_weight", 0.5)), float(get(config, "loss.max_sample_weight", 3.0))
     )
-    primary = (weights * (distribution_loss + float(get(config, "loss.regression_weight", 0.5)) * regression_loss)).mean()
+    weighted_distribution = (weights * distribution_loss).sum() / weights.sum().clamp_min(1e-8)
+    primary = (
+        float(get(config, "loss.mse_weight", 1.0)) * mse_loss.mean()
+        + float(get(config, "loss.distribution_weight", 0.2)) * weighted_distribution
+    )
     valid_ec = batch["ec_labels"] >= 0
     ec_loss = outputs["logits"].new_zeros(())
     if valid_ec.any():
         ec_loss = F.cross_entropy(outputs["ec_logits"][valid_ec], batch["ec_labels"][valid_ec])
     total = primary + float(get(config, "loss.ec_weight", 0.1)) * ec_loss
-    return total, {"distribution": distribution_loss.mean().detach(), "regression": regression_loss.mean().detach(), "ec": ec_loss.detach()}
+    return total, {
+        "mse": mse_loss.mean().detach(),
+        "distribution": weighted_distribution.detach(),
+        "ec": ec_loss.detach(),
+    }
 
 
 def _pad_hidden(hidden, graph_index, lengths):
