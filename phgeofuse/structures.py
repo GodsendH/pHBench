@@ -37,6 +37,28 @@ class Residue:
     plddt: float
 
 
+def sequence_matches(observed_sequence: str, target_sequence: str) -> bool:
+    """Match equal-length sequences while treating target X residues as unknown."""
+    return len(observed_sequence) == len(target_sequence) and all(
+        target == "X" or observed == target
+        for observed, target in zip(observed_sequence, target_sequence, strict=True)
+    )
+
+
+def _sequence_match_metadata(
+    target_sequence: str, residues: list[Residue]
+) -> dict[str, Any]:
+    observed_sequence = "".join(residue.amino_acid for residue in residues)
+    ambiguous_positions = [
+        index + 1 for index, residue in enumerate(target_sequence) if residue == "X"
+    ]
+    return {
+        "observed_sequence": observed_sequence,
+        "sequence_match_mode": "x_wildcard" if ambiguous_positions else "exact",
+        "ambiguous_positions": ambiguous_positions,
+    }
+
+
 def parse_pdb_chains(path: str | Path) -> dict[str, list[Residue]]:
     chains: dict[str, list[Residue]] = {}
     seen: set[tuple[str, int, str]] = set()
@@ -75,23 +97,25 @@ def parse_pdb_chains(path: str | Path) -> dict[str, list[Residue]]:
 
 def select_chain(path: str | Path, target_sequence: str) -> tuple[str, list[Residue]]:
     chains = parse_pdb_chains(path)
-    exact = [
+    matches = [
         (chain, residues)
         for chain, residues in chains.items()
-        if "".join(residue.amino_acid for residue in residues) == target_sequence
+        if sequence_matches(
+            "".join(residue.amino_acid for residue in residues), target_sequence
+        )
     ]
-    if len(exact) == 1:
-        return exact[0]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError("multiple structure chains match the input sequence")
     if len(chains) == 1:
-        chain, residues = next(iter(chains.items()))
+        _, residues = next(iter(chains.items()))
         observed = "".join(residue.amino_acid for residue in residues)
-        if observed != target_sequence:
-            raise ValueError(
-                f"structure sequence mismatch: expected {len(target_sequence)} residues, "
-                f"observed {len(observed)}"
-            )
-        return chain, residues
-    raise ValueError("no unique structure chain exactly matches the input sequence")
+        raise ValueError(
+            f"structure sequence mismatch: expected {len(target_sequence)} residues, "
+            f"observed {len(observed)}"
+        )
+    raise ValueError("no unique structure chain matches the input sequence")
 
 
 def download_alphafold_structure(
@@ -129,6 +153,7 @@ def download_alphafold_structure(
                 "chain": chain,
                 "mean_plddt": sum(item.plddt for item in residues) / len(residues),
                 "structure_sha256": sha256_file(destination),
+                **_sequence_match_metadata(sequence, residues),
             }
         except (requests.RequestException, ValueError, RuntimeError, json.JSONDecodeError) as exc:
             Path(destination).unlink(missing_ok=True)
@@ -182,6 +207,7 @@ def predict_esmfold_structure(
             "chain": chain,
             "mean_plddt": sum(item.plddt for item in residues) / len(residues),
             "structure_sha256": sha256_file(destination),
+            **_sequence_match_metadata(sequence, residues),
         }
     finally:
         del model
@@ -241,7 +267,7 @@ def foldseek_three_di(
                 columns = line.rstrip("\n").split("\t")
                 if len(columns) >= 3:
                     rows.append((columns[0], columns[1].upper(), columns[2].lower()))
-    matches = [row for row in rows if row[1] == sequence]
+    matches = [row for row in rows if sequence_matches(row[1], sequence)]
     if len(matches) != 1:
         raise ValueError("Foldseek did not return one chain matching the input sequence")
     _, observed, three_di = matches[0]

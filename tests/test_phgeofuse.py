@@ -14,7 +14,12 @@ from phgeofuse.graph import build_edges, graph_feature_dim
 from phgeofuse.io import ProteinRecord, parse_phopt_header, read_fasta, read_manifest
 from phgeofuse.model import PHGeoFuse, compute_loss
 from phgeofuse.retrieval import RetrievalStore, record_key
-from phgeofuse.structures import acquire_structure, foldseek_three_di
+from phgeofuse.structures import (
+    acquire_structure,
+    foldseek_three_di,
+    select_chain,
+    sequence_matches,
+)
 from phgeofuse.engine import load_checkpoint, train_model
 from utils.distributed import DistributedContext
 
@@ -50,6 +55,30 @@ class PHGeoFuseTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "offline structure cache"):
                 acquire_structure("P12345", "ACD", Path(directory) / "missing.pdb", {}, True)
 
+    def test_sequence_matching_treats_target_x_as_wildcard(self):
+        self.assertTrue(sequence_matches("ACDKFG", "ACDXFG"))
+        self.assertFalse(sequence_matches("ACEKFG", "ACDXFG"))
+        self.assertFalse(sequence_matches("ACDKF", "ACDXFG"))
+
+    def test_select_chain_accepts_x_wildcard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            structure = Path(directory) / "sample.pdb"
+            structure.write_text(
+                "".join(
+                    [
+                        _pdb_ca_line(1, "ALA", 1, 0.0),
+                        _pdb_ca_line(2, "CYS", 2, 3.0),
+                        _pdb_ca_line(3, "ASP", 3, 6.0),
+                    ]
+                )
+                + "END\n"
+            )
+            chain, residues = select_chain(structure, "AXD")
+            self.assertEqual(chain, "A")
+            self.assertEqual("".join(residue.amino_acid for residue in residues), "ACD")
+            with self.assertRaisesRegex(ValueError, "structure sequence mismatch"):
+                select_chain(structure, "AXE")
+
     def test_foldseek_masks_low_confidence_positions(self):
         with tempfile.TemporaryDirectory() as directory:
             structure = Path(directory) / "sample.pdb"
@@ -67,6 +96,24 @@ class PHGeoFuseTests(unittest.TestCase):
                     {"structure": {"plddt_mask_threshold": 70}},
                 )
         self.assertEqual(three_di, "q#e")
+
+    def test_foldseek_accepts_x_wildcard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            structure = Path(directory) / "sample.pdb"
+            structure.write_text("MODEL\nEND\n")
+
+            def fake_run(command, **kwargs):
+                Path(command[-1]).write_text("sample.pdb_A\tACD\tqwe\n")
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch("phgeofuse.structures.shutil.which", return_value="foldseek"), mock.patch(
+                "phgeofuse.structures.subprocess.run", side_effect=fake_run
+            ):
+                observed, three_di = foldseek_three_di(
+                    structure, "AXD", torch.tensor([90.0, 90.0, 90.0]), {}
+                )
+        self.assertEqual(observed, "ACD")
+        self.assertEqual(three_di, "qwe")
 
     def test_edges_are_translation_invariant(self):
         coords = torch.tensor([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [0.0, 4.0, 0.0]])
@@ -163,6 +210,13 @@ def _tiny_config():
         "retrieval": {"dropout": 0.0},
         "loss": {"soft_label_sigma": 0.35, "regression_weight": 0.5, "ec_weight": 0.1},
     }
+
+
+def _pdb_ca_line(serial: int, residue: str, number: int, x: float) -> str:
+    return (
+        f"ATOM  {serial:5d}  CA  {residue:>3s} A{number:4d}    "
+        f"{x:8.3f}{0.0:8.3f}{0.0:8.3f}{1.0:6.2f}{90.0:6.2f}          C  \n"
+    )
 
 
 def _tiny_batch():
