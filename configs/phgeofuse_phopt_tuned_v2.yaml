@@ -1,0 +1,92 @@
+data:
+  manifest: null
+  splits:
+    train: data/phopt_training.fasta
+    validation: data/phopt_validation.fasta
+    test: data/phopt_testing.fasta
+
+paths:
+  manifest: artifacts/phgeofuse/manifest.csv
+  structures: artifacts/phgeofuse/structures
+  graphs: artifacts/phgeofuse/graphs
+  embeddings: artifacts/phgeofuse/embeddings
+  retrieval: artifacts/phgeofuse/retrieval.pt
+  runs: artifacts/phgeofuse/runs
+  predictions: artifacts/phgeofuse/predictions
+
+runtime:
+  offline: true
+
+structure:
+  alphafold_api: https://alphafold.ebi.ac.uk/api/prediction/{protein_id}
+  download_timeout: 60
+  download_attempts: 3
+  esmfold_model: facebook/esmfold_v1
+  esmfold_revision: 75a3841ee059df2bf4d56688166c8fb459ddd97a
+  esmfold_chunk_size: 64
+  foldseek_binary: foldseek
+  propka_binary: propka3
+  plddt_mask_threshold: 70.0
+
+graph:
+  spatial_k: 16
+  cutoff: 16.0
+  rbf_bins: 16
+
+model:
+  mode: frozen
+  saprot_model: westlake-repl/SaProt_650M_AF2
+  saprot_revision: d9b9ad00ef61c0990e611b2b43f2231c7de24b38
+  embedding_dim: 1280
+  hidden_dim: 256
+  egnn_layers: 6
+  attention_heads: 4
+  dropout: 0.20
+  ph_min: 2.0
+  ph_max: 12.0
+  ph_step: 0.25
+  gradient_checkpointing: true
+  lora:
+    rank: 8
+    alpha: 16
+    dropout: 0.05
+
+encoding:
+  batch_size: 1
+
+retrieval:
+  top_k: 5
+  dropout: 0.15
+  require_foldseek: true
+  mmseqs_binary: mmseqs
+
+loss:
+  soft_label_sigma: 0.35
+  mse_weight: 1.0
+  distribution_weight: 0.2
+  ec_weight: 0.05
+  min_sample_weight: 0.5
+  max_sample_weight: 3.0
+
+training:
+  run_name: phgeofuse_phopt_tuned_mse_v2
+  seed: 42
+  per_device_batch_size: 2
+  global_batch_size: 32
+  num_workers: 2
+  epochs: 40
+  learning_rate: 0.00005
+  lora_learning_rate: 0.00001
+  weight_decay: 0.05
+  warmup_fraction: 0.0
+  gradient_clip: 1.0
+  early_stopping_patience: 7
+  precision: bf16
+  scheduler:
+    type: reduce_on_plateau
+    factor: 0.5
+    patience: 1
+    threshold: 0.001
+    threshold_mode: abs
+    cooldown: 0
+    min_lr: 0.000001
