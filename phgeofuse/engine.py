@@ -97,8 +97,8 @@ def train_model(records, config, context, resume: str | Path | None = None):
     updates_per_epoch = max(1, math.ceil(len(loaders["train"]) / accumulation))
     total_steps = epochs * updates_per_epoch
     warmup_steps = int(total_steps * float(get(config, "training.warmup_fraction", 0.05)))
-    scheduler, scheduler_interval = _scheduler(
-        optimizer, config, warmup_steps, total_steps
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda step: _cosine_schedule(step, warmup_steps, total_steps)
     )
     amp_dtype = _amp_dtype(config, context.device)
     scaler = torch.cuda.amp.GradScaler(enabled=context.device.type == "cuda" and amp_dtype == torch.float16)
@@ -140,8 +140,7 @@ def train_model(records, config, context, resume: str | Path | None = None):
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                if scheduler_interval == "step":
-                    scheduler.step()
+                scheduler.step()
                 global_step += 1
         train_loss = _global_average(running_loss, sample_count, context.device)
         validation = evaluate_loader(model, loaders["validation"], config, context, include_loss=True)
@@ -150,8 +149,6 @@ def train_model(records, config, context, resume: str | Path | None = None):
         )
         context.broadcast(validation_rmse, source=0)
         validation["metrics"]["rmse"] = float(validation_rmse)
-        if scheduler_interval == "epoch":
-            scheduler.step(float(validation_rmse))
         improved = float(validation_rmse) < best_rmse
         if improved:
             best_rmse = float(validation_rmse)
@@ -342,28 +339,6 @@ def _optimizer(model, config):
     if lora:
         groups.append({"params": lora, "lr": float(get(config, "training.lora_learning_rate", 1e-5))})
     return AdamW(groups, weight_decay=float(get(config, "training.weight_decay", 1e-2)))
-
-
-def _scheduler(optimizer, config, warmup_steps, total_steps):
-    scheduler_type = str(get(config, "training.scheduler.type", "cosine")).lower()
-    if scheduler_type == "cosine":
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
-            optimizer, lambda step: _cosine_schedule(step, warmup_steps, total_steps)
-        )
-        return scheduler, "step"
-    if scheduler_type in {"plateau", "reduce_on_plateau"}:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=float(get(config, "training.scheduler.factor", 0.5)),
-            patience=int(get(config, "training.scheduler.patience", 1)),
-            threshold=float(get(config, "training.scheduler.threshold", 1e-3)),
-            threshold_mode=str(get(config, "training.scheduler.threshold_mode", "abs")),
-            cooldown=int(get(config, "training.scheduler.cooldown", 0)),
-            min_lr=float(get(config, "training.scheduler.min_lr", 1e-6)),
-        )
-        return scheduler, "epoch"
-    raise ValueError(f"unknown training scheduler: {scheduler_type}")
 
 
 def _amp_dtype(config, device):

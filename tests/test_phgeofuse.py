@@ -20,7 +20,7 @@ from phgeofuse.structures import (
     select_chain,
     sequence_matches,
 )
-from phgeofuse.engine import _scheduler, load_checkpoint, train_model
+from phgeofuse.engine import load_checkpoint, train_model
 from utils.distributed import DistributedContext
 
 
@@ -218,37 +218,6 @@ class PHGeoFuseTests(unittest.TestCase):
             restored = PHGeoFuse(config, torch.device("cpu"))
             payload = load_checkpoint(checkpoint, restored)
             self.assertEqual(payload["epoch"], 0)
-
-    def test_plateau_scheduler_reduces_learning_rate_after_stale_epochs(self):
-        parameter = torch.nn.Parameter(torch.tensor(1.0))
-        optimizer = torch.optim.AdamW([parameter], lr=1e-3)
-        config = {
-            "training": {
-                "scheduler": {
-                    "type": "reduce_on_plateau",
-                    "factor": 0.5,
-                    "patience": 1,
-                    "threshold": 0.001,
-                    "threshold_mode": "abs",
-                    "min_lr": 1e-6,
-                }
-            }
-        }
-
-        scheduler, interval = _scheduler(optimizer, config, 0, 10)
-        scheduler.step(0.8)
-        scheduler.step(0.81)
-        scheduler.step(0.82)
-
-        self.assertEqual(interval, "epoch")
-        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 5e-4)
-
-        restored_optimizer = torch.optim.AdamW([parameter], lr=1e-3)
-        restored_scheduler, _ = _scheduler(restored_optimizer, config, 0, 10)
-        restored_optimizer.load_state_dict(optimizer.state_dict())
-        restored_scheduler.load_state_dict(scheduler.state_dict())
-        self.assertAlmostEqual(restored_optimizer.param_groups[0]["lr"], 5e-4)
-        self.assertEqual(restored_scheduler.state_dict(), scheduler.state_dict())
 
 
 def _tiny_config():
