@@ -268,8 +268,6 @@ def evaluate_loader(model, loader, config, context, include_loss: bool = False):
                         "key": key,
                         "label": float(batch["labels"][index]),
                         "prediction": float(outputs["mean"][index]),
-                        "base_prediction": float(outputs["base_mean"][index]),
-                        "correction": float(outputs["correction"][index]),
                         "global_prediction": float(outputs["global_mean"][index]),
                         "saprot_prediction": float(retrieval[0]),
                         "foldseek_prediction": float(retrieval[1]),
@@ -356,11 +354,6 @@ def prediction_metrics(rows):
     predictions = np.asarray([row["prediction"] for row in rows])
     metrics = regression_metrics(labels, predictions)
     metrics.update(ph_bin_metrics(labels, predictions))
-    if rows and "correction" in rows[0]:
-        corrections = np.asarray([row["correction"] for row in rows])
-        metrics["mean_correction"] = float(corrections.mean())
-        metrics["mean_absolute_correction"] = float(np.abs(corrections).mean())
-        metrics["max_absolute_correction"] = float(np.abs(corrections).max())
 
     expert_specs = (
         ("global", "global_prediction", None),

@@ -189,50 +189,6 @@ class PHGeoFuseTests(unittest.TestCase):
         self.assertTrue(any(parameter.grad is not None for parameter in model.geometry.parameters()))
         self.assertTrue(all(parameter.grad is None for parameter in model.gate.parameters()))
 
-    def test_residual_fusion_is_bounded_and_keeps_coordinates_fixed(self):
-        config = _tiny_config()
-        config["model"]["update_coordinates"] = False
-        config["fusion"] = {
-            "mode": "residual",
-            "base_weights": [0.0, 0.33, 0.67],
-            "max_correction": 0.75,
-        }
-        config["loss"].update(
-            {
-                "distribution_weight": 0.0,
-                "ec_weight": 0.0,
-                "residual_weight": 0.05,
-                "weight_mse": True,
-            }
-        )
-        model = PHGeoFuse(config, torch.device("cpu"))
-        batch = _tiny_batch()
-        batch["retrieval"][0, 8] = 0.0
-        batch["retrieval"][1, 7:] = 0.0
-
-        outputs = model(batch)
-
-        torch.testing.assert_close(
-            outputs["gate_weights"],
-            torch.tensor([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]),
-        )
-        self.assertTrue(bool((outputs["correction"].abs() <= 0.75).all()))
-        torch.testing.assert_close(outputs["coords"], batch["coords"])
-        torch.testing.assert_close(outputs["correction"][1], torch.tensor(0.0))
-        loss, parts = compute_loss(outputs, batch, config)
-        loss.backward()
-        self.assertIn("residual", parts)
-        self.assertTrue(any(parameter.grad is not None for parameter in model.geometry.parameters()))
-        self.assertTrue(all(parameter.grad is None for parameter in model.gate.parameters()))
-        self.assertTrue(all(parameter.grad is None for parameter in model.ec_head.parameters()))
-        self.assertTrue(
-            all(
-                parameter.grad is None
-                for layer in model.geometry.layers
-                for parameter in layer.coordinate.parameters()
-            )
-        )
-
     def test_loss_uses_final_fused_mse_as_primary_objective(self):
         config = _tiny_config()
         config["loss"].update(
@@ -253,33 +209,6 @@ class PHGeoFuseTests(unittest.TestCase):
 
         torch.testing.assert_close(loss, torch.tensor(2.5))
         torch.testing.assert_close(parts["mse"], torch.tensor(2.5))
-
-    def test_loss_can_weight_primary_mse(self):
-        config = _tiny_config()
-        config["loss"].update(
-            {
-                "mse_weight": 1.0,
-                "distribution_weight": 0.0,
-                "ec_weight": 0.0,
-                "weight_mse": True,
-            }
-        )
-        batch = {
-            "labels": torch.tensor([6.0, 8.0]),
-            "weights": torch.tensor([0.5, 3.0]),
-            "ec_labels": torch.tensor([-1, -1]),
-        }
-        outputs = {
-            "mean": torch.tensor([7.0, 6.0]),
-            "logits": torch.zeros(2, 5),
-            "ec_logits": torch.zeros(2, 7),
-        }
-
-        loss, parts = compute_loss(outputs, batch, config)
-
-        expected = torch.tensor(12.5 / 3.5)
-        torch.testing.assert_close(loss, expected)
-        torch.testing.assert_close(parts["mse"], expected)
 
     def test_tiny_training_writes_reloadable_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
