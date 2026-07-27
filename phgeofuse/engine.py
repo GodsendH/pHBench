@@ -33,6 +33,23 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _capture_rng_state():
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def _restore_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state["cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
 def build_loaders(records, retrieval, config, context):
     mode = str(get(config, "model.mode", "frozen"))
     datasets = {
@@ -72,19 +89,19 @@ def build_loaders(records, retrieval, config, context):
             evaluation_sampler = DistributedShardSampler(
                 len(datasets["train"]), context.rank, context.world_size
             )
-            loaders["train_evaluation"] = DataLoader(
-                datasets["train"],
-                batch_size=batch_size,
-                sampler=evaluation_sampler,
-                shuffle=False,
-                num_workers=workers,
-                pin_memory=context.device.type == "cuda",
-                persistent_workers=workers > 0,
-                collate_fn=collate_graphs,
-                drop_last=False,
-            )
         else:
-            loaders["train_evaluation"] = loaders["train"]
+            evaluation_sampler = None
+        loaders["train_evaluation"] = DataLoader(
+            datasets["train"],
+            batch_size=batch_size,
+            sampler=evaluation_sampler,
+            shuffle=False,
+            num_workers=workers,
+            pin_memory=context.device.type == "cuda",
+            persistent_workers=workers > 0,
+            collate_fn=collate_graphs,
+            drop_last=False,
+        )
     return loaders, train_sampler
 
 
@@ -165,9 +182,11 @@ def train_model(records, config, context, resume: str | Path | None = None):
         validation = evaluate_loader(model, loaders["validation"], config, context, include_loss=True)
         train_evaluation = None
         if "train_evaluation" in loaders:
+            rng_state = _capture_rng_state()
             train_evaluation = evaluate_loader(
                 model, loaders["train_evaluation"], config, context, include_loss=True
             )
+            _restore_rng_state(rng_state)
         validation_rmse = torch.tensor(
             validation["metrics"].get("rmse", 0.0), device=context.device
         )
@@ -419,8 +438,7 @@ def checkpoint_payload(model, optimizer, scheduler, scaler, config, epoch, globa
         "scaler_state_dict": scaler.state_dict(), "epoch": epoch, "global_step": global_step,
         "best_rmse": best_rmse, "stale_epochs": stale, "config": config,
         "config_hash": config_hash(config), "world_size": world_size,
-        "rng": {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None},
+        "rng": _capture_rng_state(),
     }
 
 

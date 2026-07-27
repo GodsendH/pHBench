@@ -1,3 +1,4 @@
+import copy
 import json
 import math
 import tempfile
@@ -167,6 +168,27 @@ class PHGeoFuseTests(unittest.TestCase):
         self.assertTrue(any(parameter.grad is not None for parameter in model.parameters()))
         self.assertIn("ec", parts)
 
+    def test_fixed_fusion_renormalizes_unavailable_experts(self):
+        config = _tiny_config()
+        config["fusion"] = {
+            "mode": "fixed",
+            "fixed_weights": [0.25, 0.25, 0.5],
+        }
+        model = PHGeoFuse(config, torch.device("cpu"))
+        batch = _tiny_batch()
+        batch["retrieval"][0, 8] = 0.0
+
+        outputs = model(batch)
+
+        torch.testing.assert_close(
+            outputs["gate_weights"],
+            torch.tensor([[0.5, 0.5, 0.0], [0.25, 0.25, 0.5]]),
+        )
+        loss, _ = compute_loss(outputs, batch, config)
+        loss.backward()
+        self.assertTrue(any(parameter.grad is not None for parameter in model.geometry.parameters()))
+        self.assertTrue(all(parameter.grad is None for parameter in model.gate.parameters()))
+
     def test_loss_uses_final_fused_mse_as_primary_objective(self):
         config = _tiny_config()
         config["loss"].update(
@@ -230,6 +252,51 @@ class PHGeoFuseTests(unittest.TestCase):
             self.assertEqual(
                 set(row["validation_loss_components"]), {"mse", "distribution", "ec"}
             )
+
+    def test_train_diagnostics_do_not_change_parameter_updates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _tiny_config()
+            config.update(
+                {
+                    "_root": str(root),
+                    "paths": {
+                        "retrieval": str(root / "retrieval.pt"),
+                        "runs": str(root / "runs"),
+                    },
+                    "training": {
+                        "seed": 7, "run_name": "without-diagnostics",
+                        "per_device_batch_size": 2, "global_batch_size": 2,
+                        "num_workers": 0, "epochs": 2, "learning_rate": 1e-3,
+                        "weight_decay": 0.0, "warmup_fraction": 0.0,
+                        "early_stopping_patience": 3,
+                    },
+                }
+            )
+            config["retrieval"].update(
+                {"top_k": 1, "require_foldseek": False, "mmseqs_binary": "missing"}
+            )
+            config["structure"] = {"foldseek_binary": "missing"}
+            records = _tiny_records(root)
+            context = DistributedContext(False, 0, 0, 1, torch.device("cpu"))
+
+            train_model(records, config, context)
+            diagnostic_config = copy.deepcopy(config)
+            diagnostic_config["training"]["run_name"] = "with-diagnostics"
+            diagnostic_config["training"]["diagnostics"] = {"evaluate_train": True}
+            train_model(records, diagnostic_config, context)
+
+            baseline = torch.load(
+                root / "runs" / "without-diagnostics_frozen_seed7" / "last.pt",
+                map_location="cpu",
+            )["model_state_dict"]
+            diagnostic = torch.load(
+                root / "runs" / "with-diagnostics_frozen_seed7" / "last.pt",
+                map_location="cpu",
+            )["model_state_dict"]
+            self.assertEqual(set(baseline), set(diagnostic))
+            for name in baseline:
+                torch.testing.assert_close(baseline[name], diagnostic[name], rtol=0, atol=0)
 
 
 def _tiny_config():

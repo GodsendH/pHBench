@@ -111,6 +111,18 @@ class PHGeoFuse(nn.Module):
         embedding_dim = int(get(config, "model.embedding_dim", 1280))
         edge_dim = int(get(config, "graph.rbf_bins", 16)) + 2
         self.retrieval_dropout = float(get(config, "retrieval.dropout", 0.4))
+        self.fusion_mode = str(get(config, "fusion.mode", "learned")).lower()
+        if self.fusion_mode not in {"learned", "fixed"}:
+            raise ValueError("fusion.mode must be 'learned' or 'fixed'")
+        fixed_weights = torch.tensor(
+            get(config, "fusion.fixed_weights", [0.25, 0.25, 0.5]),
+            dtype=torch.float32,
+        )
+        if fixed_weights.shape != (3,) or bool((fixed_weights < 0).any()) or float(fixed_weights.sum()) <= 0:
+            raise ValueError("fusion.fixed_weights must contain three non-negative values")
+        self.register_buffer(
+            "fixed_gate_weights", fixed_weights / fixed_weights.sum(), persistent=False
+        )
         self.saprot_model = None
         self.saprot_tokenizer = None
         if self.mode == "lora":
@@ -131,6 +143,8 @@ class PHGeoFuse(nn.Module):
         )
         self.ec_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 7))
         self.gate = nn.Sequential(nn.Linear(6, 64), nn.SiLU(), nn.Dropout(0.1), nn.Linear(64, 3))
+        if self.fusion_mode == "fixed":
+            self.gate.requires_grad_(False)
 
     def _initialize_lora(self, config, device):
         try:
@@ -197,7 +211,6 @@ class PHGeoFuse(nn.Module):
         gate_features = torch.stack(
             [retrieval[:, 2], retrieval[:, 3], retrieval[:, 4], retrieval[:, 5], retrieval[:, 6], global_variance], dim=-1
         )
-        gate_logits = self.gate(gate_features)
         available = torch.stack(
             [torch.ones_like(retrieval[:, 7]), retrieval[:, 7], retrieval[:, 8]], dim=-1
         ).bool()
@@ -208,8 +221,14 @@ class PHGeoFuse(nn.Module):
         if self.training and self.retrieval_dropout > 0:
             dropped = torch.rand_like(available[:, 1:].float()) < self.retrieval_dropout
             available[:, 1:] &= ~dropped
-        gate_logits = gate_logits.masked_fill(~available, torch.finfo(gate_logits.dtype).min)
-        gate_weights = torch.softmax(gate_logits, dim=-1)
+        if self.fusion_mode == "fixed":
+            gate_weights = self.fixed_gate_weights.to(hidden).expand(len(available), -1)
+            gate_weights = gate_weights * available.to(gate_weights.dtype)
+            gate_weights = gate_weights / gate_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        else:
+            gate_logits = self.gate(gate_features)
+            gate_logits = gate_logits.masked_fill(~available, torch.finfo(gate_logits.dtype).min)
+            gate_weights = torch.softmax(gate_logits, dim=-1)
         expert_means = torch.stack([global_mean, retrieval[:, 0], retrieval[:, 1]], dim=-1)
         mean = (gate_weights * expert_means).sum(dim=-1)
         expert_variances = torch.stack([global_variance, retrieval[:, 5], retrieval[:, 6]], dim=-1)
