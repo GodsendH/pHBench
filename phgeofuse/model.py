@@ -26,8 +26,15 @@ def scatter_mean(values: torch.Tensor, index: torch.Tensor, size: int) -> torch.
 
 
 class EGNNLayer(nn.Module):
-    def __init__(self, hidden_dim: int, edge_dim: int, dropout: float):
+    def __init__(
+        self,
+        hidden_dim: int,
+        edge_dim: int,
+        dropout: float,
+        update_coordinates: bool = True,
+    ):
         super().__init__()
+        self.update_coordinates = update_coordinates
         self.message = nn.Sequential(
             nn.Linear(hidden_dim * 2 + edge_dim + 1, hidden_dim),
             nn.SiLU(),
@@ -36,6 +43,8 @@ class EGNNLayer(nn.Module):
             nn.SiLU(),
         )
         self.coordinate = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1, bias=False))
+        if not update_coordinates:
+            self.coordinate.requires_grad_(False)
         self.update = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim), nn.SiLU(), nn.Dropout(dropout), nn.Linear(hidden_dim, hidden_dim)
         )
@@ -49,18 +58,32 @@ class EGNNLayer(nn.Module):
             torch.cat([hidden[source], hidden[target], edge_features, squared_distance], dim=-1)
         )
         aggregated = scatter_sum(messages, target, hidden.shape[0])
-        coordinate_scale = self.coordinate(messages).tanh()
-        delta = relative / squared_distance.sqrt().clamp_min(1e-3) * coordinate_scale
-        coords = coords + scatter_mean(delta, target, hidden.shape[0])
+        if self.update_coordinates:
+            coordinate_scale = self.coordinate(messages).tanh()
+            delta = relative / squared_distance.sqrt().clamp_min(1e-3) * coordinate_scale
+            coords = coords + scatter_mean(delta, target, hidden.shape[0])
         hidden = self.norm(hidden + self.update(torch.cat([hidden, aggregated], dim=-1)))
         return hidden, coords
 
 
 class GeometryEncoder(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, edge_dim: int, layers: int, dropout: float):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        edge_dim: int,
+        layers: int,
+        dropout: float,
+        update_coordinates: bool = True,
+    ):
         super().__init__()
         self.project = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU())
-        self.layers = nn.ModuleList([EGNNLayer(hidden_dim, edge_dim, dropout) for _ in range(layers)])
+        self.layers = nn.ModuleList(
+            [
+                EGNNLayer(hidden_dim, edge_dim, dropout, update_coordinates)
+                for _ in range(layers)
+            ]
+        )
 
     def forward(self, node_features, coords, edge_index, edge_features):
         hidden = self.project(node_features)
@@ -112,8 +135,8 @@ class PHGeoFuse(nn.Module):
         edge_dim = int(get(config, "graph.rbf_bins", 16)) + 2
         self.retrieval_dropout = float(get(config, "retrieval.dropout", 0.4))
         self.fusion_mode = str(get(config, "fusion.mode", "learned")).lower()
-        if self.fusion_mode not in {"learned", "fixed"}:
-            raise ValueError("fusion.mode must be 'learned' or 'fixed'")
+        if self.fusion_mode not in {"learned", "fixed", "residual"}:
+            raise ValueError("fusion.mode must be 'learned', 'fixed', or 'residual'")
         fixed_weights = torch.tensor(
             get(config, "fusion.fixed_weights", [0.25, 0.25, 0.5]),
             dtype=torch.float32,
@@ -123,6 +146,18 @@ class PHGeoFuse(nn.Module):
         self.register_buffer(
             "fixed_gate_weights", fixed_weights / fixed_weights.sum(), persistent=False
         )
+        base_weights = torch.tensor(
+            get(config, "fusion.base_weights", [0.0, 0.33, 0.67]),
+            dtype=torch.float32,
+        )
+        if base_weights.shape != (3,) or bool((base_weights < 0).any()) or float(base_weights.sum()) <= 0:
+            raise ValueError("fusion.base_weights must contain three non-negative values")
+        self.register_buffer(
+            "residual_base_weights", base_weights / base_weights.sum(), persistent=False
+        )
+        self.max_correction = float(get(config, "fusion.max_correction", 0.75))
+        if self.max_correction <= 0:
+            raise ValueError("fusion.max_correction must be positive")
         self.saprot_model = None
         self.saprot_tokenizer = None
         if self.mode == "lora":
@@ -134,6 +169,7 @@ class PHGeoFuse(nn.Module):
         self.geometry = GeometryEncoder(
             embedding_dim + graph_feature_dim(), hidden_dim, edge_dim,
             int(get(config, "model.egnn_layers", 6)), float(get(config, "model.dropout", 0.1)),
+            bool(get(config, "model.update_coordinates", True)),
         )
         self.decoder = PHConditionedDecoder(
             hidden_dim, int(get(config, "model.attention_heads", 4)),
@@ -142,8 +178,10 @@ class PHGeoFuse(nn.Module):
             not bool(get(config, "ablation.disable_ph_conditioning", False)),
         )
         self.ec_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 7))
+        if float(get(config, "loss.ec_weight", 0.1)) <= 0:
+            self.ec_head.requires_grad_(False)
         self.gate = nn.Sequential(nn.Linear(6, 64), nn.SiLU(), nn.Dropout(0.1), nn.Linear(64, 3))
-        if self.fusion_mode == "fixed":
+        if self.fusion_mode != "learned":
             self.gate.requires_grad_(False)
 
     def _initialize_lora(self, config, device):
@@ -225,18 +263,37 @@ class PHGeoFuse(nn.Module):
             gate_weights = self.fixed_gate_weights.to(hidden).expand(len(available), -1)
             gate_weights = gate_weights * available.to(gate_weights.dtype)
             gate_weights = gate_weights / gate_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        elif self.fusion_mode == "residual":
+            gate_weights = self.residual_base_weights.to(hidden).expand(len(available), -1)
+            gate_weights = gate_weights * available.to(gate_weights.dtype)
+            weight_sum = gate_weights.sum(dim=-1, keepdim=True)
+            gate_weights = gate_weights / weight_sum.clamp_min(1e-8)
+            fallback = torch.zeros_like(gate_weights)
+            fallback[:, 0] = 1.0
+            gate_weights = torch.where(weight_sum > 0, gate_weights, fallback)
         else:
             gate_logits = self.gate(gate_features)
             gate_logits = gate_logits.masked_fill(~available, torch.finfo(gate_logits.dtype).min)
             gate_weights = torch.softmax(gate_logits, dim=-1)
         expert_means = torch.stack([global_mean, retrieval[:, 0], retrieval[:, 1]], dim=-1)
-        mean = (gate_weights * expert_means).sum(dim=-1)
+        base_mean = (gate_weights * expert_means).sum(dim=-1)
+        correction = torch.zeros_like(base_mean)
+        if self.fusion_mode == "residual":
+            correction = self.max_correction * torch.tanh(
+                (global_mean - base_mean) / self.max_correction
+            )
+        mean = base_mean + correction
         expert_variances = torch.stack([global_variance, retrieval[:, 5], retrieval[:, 6]], dim=-1)
-        variance = (gate_weights * (expert_variances + (expert_means - mean.unsqueeze(-1)).square())).sum(dim=-1)
+        variance = (
+            gate_weights
+            * (expert_variances + (expert_means - base_mean.unsqueeze(-1)).square())
+        ).sum(dim=-1)
         return {
             "logits": logits,
             "probabilities": probabilities,
             "global_mean": global_mean,
+            "base_mean": base_mean,
+            "correction": correction,
             "mean": mean,
             "variance": variance,
             "ec_logits": ec_logits,
@@ -261,21 +318,34 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, Any], config
     weights = batch["weights"].clamp(
         float(get(config, "loss.min_sample_weight", 0.5)), float(get(config, "loss.max_sample_weight", 3.0))
     )
-    weighted_distribution = (weights * distribution_loss).sum() / weights.sum().clamp_min(1e-8)
+    weight_sum = weights.sum().clamp_min(1e-8)
+    weighted_distribution = (weights * distribution_loss).sum() / weight_sum
+    weighted_mse = (weights * mse_loss).sum() / weight_sum
+    primary_mse = weighted_mse if bool(get(config, "loss.weight_mse", False)) else mse_loss.mean()
+    correction = outputs.get("correction", mse_loss.new_zeros(mse_loss.shape))
+    residual_penalty = correction.square().mean()
     primary = (
-        float(get(config, "loss.mse_weight", 1.0)) * mse_loss.mean()
+        float(get(config, "loss.mse_weight", 1.0)) * primary_mse
         + float(get(config, "loss.distribution_weight", 0.2)) * weighted_distribution
     )
     valid_ec = batch["ec_labels"] >= 0
     ec_loss = outputs["logits"].new_zeros(())
     if valid_ec.any():
         ec_loss = F.cross_entropy(outputs["ec_logits"][valid_ec], batch["ec_labels"][valid_ec])
-    total = primary + float(get(config, "loss.ec_weight", 0.1)) * ec_loss
-    return total, {
-        "mse": mse_loss.mean().detach(),
+    residual_weight = float(get(config, "loss.residual_weight", 0.0))
+    total = (
+        primary
+        + float(get(config, "loss.ec_weight", 0.1)) * ec_loss
+        + residual_weight * residual_penalty
+    )
+    components = {
+        "mse": primary_mse.detach(),
         "distribution": weighted_distribution.detach(),
         "ec": ec_loss.detach(),
     }
+    if residual_weight > 0 or str(get(config, "fusion.mode", "learned")).lower() == "residual":
+        components["residual"] = residual_penalty.detach()
+    return total, components
 
 
 def _pad_hidden(hidden, graph_index, lengths):
