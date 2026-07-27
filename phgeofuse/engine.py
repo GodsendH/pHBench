@@ -66,6 +66,25 @@ def build_loaders(records, retrieval, config, context):
             collate_fn=collate_graphs,
             drop_last=False,
         )
+    if bool(get(config, "training.diagnostics.evaluate_train", False)):
+        if context.distributed:
+            from utils.distributed import DistributedShardSampler
+            evaluation_sampler = DistributedShardSampler(
+                len(datasets["train"]), context.rank, context.world_size
+            )
+            loaders["train_evaluation"] = DataLoader(
+                datasets["train"],
+                batch_size=batch_size,
+                sampler=evaluation_sampler,
+                shuffle=False,
+                num_workers=workers,
+                pin_memory=context.device.type == "cuda",
+                persistent_workers=workers > 0,
+                collate_fn=collate_graphs,
+                drop_last=False,
+            )
+        else:
+            loaders["train_evaluation"] = loaders["train"]
     return loaders, train_sampler
 
 
@@ -144,6 +163,11 @@ def train_model(records, config, context, resume: str | Path | None = None):
                 global_step += 1
         train_loss = _global_average(running_loss, sample_count, context.device)
         validation = evaluate_loader(model, loaders["validation"], config, context, include_loss=True)
+        train_evaluation = None
+        if "train_evaluation" in loaders:
+            train_evaluation = evaluate_loader(
+                model, loaders["train_evaluation"], config, context, include_loss=True
+            )
         validation_rmse = torch.tensor(
             validation["metrics"].get("rmse", 0.0), device=context.device
         )
@@ -160,7 +184,21 @@ def train_model(records, config, context, resume: str | Path | None = None):
                 "epoch": epoch, "global_step": global_step, "train_loss": train_loss,
                 "validation": validation["metrics"], "best_rmse": best_rmse,
                 "learning_rate": optimizer.param_groups[0]["lr"],
+                "validation_loss": validation["loss"],
+                "validation_loss_components": validation["loss_components"],
             }
+            if train_evaluation is not None:
+                row.update(
+                    {
+                        "train_evaluation": train_evaluation["metrics"],
+                        "train_evaluation_loss": train_evaluation["loss"],
+                        "train_evaluation_loss_components": train_evaluation["loss_components"],
+                        "generalization_gap_rmse": (
+                            validation["metrics"]["rmse"]
+                            - train_evaluation["metrics"]["rmse"]
+                        ),
+                    }
+                )
             with (run_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, sort_keys=True) + "\n")
             checkpoint = checkpoint_payload(
@@ -169,8 +207,12 @@ def train_model(records, config, context, resume: str | Path | None = None):
             atomic_torch_save(run_dir / "last.pt", checkpoint)
             if improved:
                 atomic_torch_save(run_dir / "best.pt", checkpoint)
+            train_rmse = (
+                f" train_rmse={train_evaluation['metrics']['rmse']:.4f}"
+                if train_evaluation is not None else ""
+            )
             print(
-                f"epoch={epoch + 1} train_loss={train_loss:.4f} "
+                f"epoch={epoch + 1} train_loss={train_loss:.4f}{train_rmse} "
                 f"val_rmse={validation['metrics']['rmse']:.4f} best={best_rmse:.4f}"
             )
         stop = torch.tensor(float(stale >= patience), device=context.device)
@@ -185,22 +227,33 @@ def evaluate_loader(model, loader, config, context, include_loss: bool = False):
     model.eval()
     local_rows = []
     local_loss, local_count = 0.0, 0
+    local_component_sums: dict[str, float] = {}
     with torch.inference_mode():
         for raw_batch in loader:
             batch = move_batch(raw_batch, context.device)
             with _autocast(context.device, _amp_dtype(config, context.device)):
                 outputs = model(batch)
                 if include_loss:
-                    loss, _ = compute_loss(outputs, batch, config)
+                    loss, components = compute_loss(outputs, batch, config)
                     local_loss += float(loss) * len(batch["labels"])
                     local_count += len(batch["labels"])
+                    for name, value in components.items():
+                        local_component_sums[name] = (
+                            local_component_sums.get(name, 0.0)
+                            + float(value) * len(batch["labels"])
+                        )
             for index, key in enumerate(batch["keys"]):
+                retrieval = batch["retrieval"][index]
                 local_rows.append(
                     {
                         "key": key,
                         "label": float(batch["labels"][index]),
                         "prediction": float(outputs["mean"][index]),
                         "global_prediction": float(outputs["global_mean"][index]),
+                        "saprot_prediction": float(retrieval[0]),
+                        "foldseek_prediction": float(retrieval[1]),
+                        "saprot_available": bool(retrieval[7]),
+                        "foldseek_available": bool(retrieval[8]),
                         "uncertainty": float(outputs["variance"][index].sqrt()),
                         "global_gate": float(outputs["gate_weights"][index, 0]),
                         "saprot_gate": float(outputs["gate_weights"][index, 1]),
@@ -210,14 +263,15 @@ def evaluate_loader(model, loader, config, context, include_loss: bool = False):
     rows = _gather_rows(local_rows, context)
     result = {"rows": rows if context.is_main else []}
     if context.is_main:
-        labels = np.asarray([row["label"] for row in rows])
-        predictions = np.asarray([row["prediction"] for row in rows])
-        result["metrics"] = regression_metrics(labels, predictions)
-        result["metrics"].update(ph_bin_metrics(labels, predictions))
+        result["metrics"] = prediction_metrics(rows)
     else:
         result["metrics"] = {}
     if include_loss:
         result["loss"] = _global_average(local_loss, local_count, context.device)
+        result["loss_components"] = {
+            name: _global_average(value, local_count, context.device)
+            for name, value in local_component_sums.items()
+        }
     return result
 
 
@@ -246,12 +300,20 @@ def regression_metrics(labels: np.ndarray, predictions: np.ndarray) -> dict[str,
     from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
     mse = mean_squared_error(labels, predictions)
-    correlation = spearmanr(labels, predictions).statistic
+    has_correlation = (
+        labels.size > 1
+        and float(np.ptp(labels)) > 0.0
+        and float(np.ptp(predictions)) > 0.0
+    )
+    correlation = spearmanr(labels, predictions).statistic if has_correlation else 0.0
+    correlation = float(correlation) if math.isfinite(float(correlation)) else 0.0
+    r2 = float(r2_score(labels, predictions)) if float(np.ptp(labels)) > 0.0 else 0.0
     return {
         "mse": float(mse), "rmse": float(math.sqrt(mse)),
         "mae": float(mean_absolute_error(labels, predictions)),
-        "r2": float(r2_score(labels, predictions)),
-        "spearman": float(correlation),
+        "r2": r2,
+        "spearman": correlation,
+        "bias": float(np.mean(predictions - labels)),
     }
 
 
@@ -260,9 +322,83 @@ def ph_bin_metrics(labels, predictions):
     for name, lower, upper in (("acidic", -math.inf, 6.0), ("neutral", 6.0, 8.0), ("alkaline", 8.0, math.inf)):
         mask = (labels < upper) & (labels >= lower)
         if mask.any():
-            result[f"rmse_{name}"] = float(np.sqrt(np.mean((labels[mask] - predictions[mask]) ** 2)))
+            errors = predictions[mask] - labels[mask]
+            result[f"rmse_{name}"] = float(np.sqrt(np.mean(errors ** 2)))
+            result[f"mae_{name}"] = float(np.mean(np.abs(errors)))
+            result[f"bias_{name}"] = float(np.mean(errors))
             result[f"count_{name}"] = int(mask.sum())
     return result
+
+
+def prediction_metrics(rows):
+    labels = np.asarray([row["label"] for row in rows])
+    predictions = np.asarray([row["prediction"] for row in rows])
+    metrics = regression_metrics(labels, predictions)
+    metrics.update(ph_bin_metrics(labels, predictions))
+
+    expert_specs = (
+        ("global", "global_prediction", None),
+        ("saprot", "saprot_prediction", "saprot_available"),
+        ("foldseek", "foldseek_prediction", "foldseek_available"),
+    )
+    expert_predictions = []
+    expert_availability = []
+    for prefix, prediction_key, availability_key in expert_specs:
+        available = np.ones(len(rows), dtype=bool) if availability_key is None else np.asarray(
+            [row[availability_key] for row in rows], dtype=bool
+        )
+        values = np.asarray([row[prediction_key] for row in rows])
+        expert_predictions.append(values)
+        expert_availability.append(available)
+        metrics[f"{prefix}_count"] = int(available.sum())
+        if available.any():
+            for name, value in regression_metrics(labels[available], values[available]).items():
+                metrics[f"{prefix}_{name}"] = value
+
+    bins = (
+        ("acidic", labels < 6.0),
+        ("neutral", (labels >= 6.0) & (labels < 8.0)),
+        ("alkaline", labels >= 8.0),
+    )
+    for gate_name in ("global_gate", "saprot_gate", "foldseek_gate"):
+        gate_values = np.asarray([row[gate_name] for row in rows])
+        metrics[f"mean_{gate_name}"] = float(gate_values.mean())
+        for bin_name, mask in bins:
+            if mask.any():
+                metrics[f"mean_{gate_name}_{bin_name}"] = float(gate_values[mask].mean())
+
+    experts = np.stack(expert_predictions, axis=1)
+    availability = np.stack(expert_availability, axis=1)
+    errors = np.where(availability, np.abs(experts - labels[:, None]), np.inf)
+    best_expert = errors.argmin(axis=1)
+    oracle = experts[np.arange(len(rows)), best_expert]
+    gates = np.stack(
+        [np.asarray([row[name] for row in rows]) for name in ("global_gate", "saprot_gate", "foldseek_gate")],
+        axis=1,
+    )
+    metrics["oracle_rmse"] = float(np.sqrt(np.mean((oracle - labels) ** 2)))
+    metrics["gate_best_expert_rate"] = float(np.mean(gates.argmax(axis=1) == best_expert))
+    global_errors = np.abs(expert_predictions[0] - labels)
+    for index, prefix in ((1, "saprot"), (2, "foldseek")):
+        available = expert_availability[index]
+        advantage = global_errors - np.abs(expert_predictions[index] - labels)
+        metrics[f"gate_advantage_corr_{prefix}"] = _safe_pearson(
+            gates[available, index], advantage[available]
+        )
+    uncertainty = np.asarray([row["uncertainty"] for row in rows])
+    metrics["uncertainty_absolute_error_corr"] = _safe_pearson(
+        uncertainty, np.abs(predictions - labels)
+    )
+    return metrics
+
+
+def _safe_pearson(left, right):
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    if left.size < 2 or left.std() == 0.0 or right.std() == 0.0:
+        return 0.0
+    value = float(np.corrcoef(left, right)[0, 1])
+    return value if math.isfinite(value) else 0.0
 
 
 def checkpoint_payload(model, optimizer, scheduler, scaler, config, epoch, global_step, best_rmse, stale, world_size):

@@ -204,6 +204,7 @@ class PHGeoFuseTests(unittest.TestCase):
                         "global_batch_size": 2, "num_workers": 0, "epochs": 1,
                         "learning_rate": 1e-3, "weight_decay": 0.0,
                         "warmup_fraction": 0.0, "early_stopping_patience": 2,
+                        "diagnostics": {"evaluate_train": True},
                     },
                 }
             )
@@ -218,6 +219,17 @@ class PHGeoFuseTests(unittest.TestCase):
             restored = PHGeoFuse(config, torch.device("cpu"))
             payload = load_checkpoint(checkpoint, restored)
             self.assertEqual(payload["epoch"], 0)
+            metrics_path = root / "runs" / "smoke_frozen_seed3" / "metrics.jsonl"
+            row = json.loads(metrics_path.read_text().splitlines()[0])
+            self.assertIn("train_evaluation", row)
+            self.assertIn("global_rmse", row["validation"])
+            self.assertIn("bias_neutral", row["validation"])
+            self.assertIn("mean_global_gate", row["validation"])
+            self.assertIn("gate_best_expert_rate", row["validation"])
+            self.assertIn("generalization_gap_rmse", row)
+            self.assertEqual(
+                set(row["validation_loss_components"]), {"mse", "distribution", "ec"}
+            )
 
 
 def _tiny_config():
