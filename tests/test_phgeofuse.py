@@ -189,6 +189,75 @@ class PHGeoFuseTests(unittest.TestCase):
         self.assertTrue(any(parameter.grad is not None for parameter in model.geometry.parameters()))
         self.assertTrue(all(parameter.grad is None for parameter in model.gate.parameters()))
 
+    def test_reliability_gate_uses_supervision_and_masks_unavailable_experts(self):
+        config = _tiny_config()
+        config["fusion"] = {
+            "mode": "reliability",
+            "gate_hidden_dim": 16,
+            "gate_dropout": 0.0,
+            "gate_temperature": 1.5,
+            "gate_prior": [0.25, 0.25, 0.5],
+        }
+        config["loss"].update(
+            {
+                "gate_supervision_weight": 1.0,
+                "gate_prior_weight": 0.01,
+                "gate_target_temperature": 0.3,
+            }
+        )
+        model = PHGeoFuse(config, torch.device("cpu"))
+        batch = _tiny_batch()
+        batch["retrieval"][0, 8] = 0.0
+
+        outputs = model(batch)
+        loss, parts = compute_loss(outputs, batch, config)
+        loss.backward()
+
+        self.assertEqual(model.reliability_gate[0].in_features, 15)
+        torch.testing.assert_close(outputs["gate_weights"].sum(dim=-1), torch.ones(2))
+        torch.testing.assert_close(outputs["gate_weights"][0, 2], torch.tensor(0.0))
+        self.assertIn("gate_supervision", parts)
+        self.assertIn("gate_prior", parts)
+        self.assertTrue(
+            any(parameter.grad is not None for parameter in model.reliability_gate.parameters())
+        )
+        self.assertTrue(all(parameter.grad is None for parameter in model.gate.parameters()))
+
+    def test_supervised_gate_loss_pushes_probability_to_best_expert(self):
+        config = _tiny_config()
+        config["fusion"] = {"mode": "reliability"}
+        config["loss"].update(
+            {
+                "mse_weight": 0.0,
+                "distribution_weight": 0.0,
+                "ec_weight": 0.0,
+                "gate_supervision_weight": 1.0,
+                "gate_prior_weight": 0.0,
+                "gate_target_temperature": 0.1,
+            }
+        )
+        gate_logits = torch.zeros(1, 3, requires_grad=True)
+        outputs = {
+            "mean": torch.tensor([7.0]),
+            "logits": torch.zeros(1, 5),
+            "ec_logits": torch.zeros(1, 7),
+            "gate_weights": torch.softmax(gate_logits, dim=-1),
+            "expert_means": torch.tensor([[7.0, 5.0, 9.0]]),
+            "expert_available": torch.ones(1, 3, dtype=torch.bool),
+        }
+        batch = {
+            "labels": torch.tensor([7.0]),
+            "weights": torch.ones(1),
+            "ec_labels": torch.tensor([-1]),
+        }
+
+        loss, _ = compute_loss(outputs, batch, config)
+        loss.backward()
+
+        self.assertLess(float(gate_logits.grad[0, 0]), 0.0)
+        self.assertGreater(float(gate_logits.grad[0, 1]), 0.0)
+        self.assertGreater(float(gate_logits.grad[0, 2]), 0.0)
+
     def test_loss_uses_final_fused_mse_as_primary_objective(self):
         config = _tiny_config()
         config["loss"].update(

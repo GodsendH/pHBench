@@ -112,8 +112,8 @@ class PHGeoFuse(nn.Module):
         edge_dim = int(get(config, "graph.rbf_bins", 16)) + 2
         self.retrieval_dropout = float(get(config, "retrieval.dropout", 0.4))
         self.fusion_mode = str(get(config, "fusion.mode", "learned")).lower()
-        if self.fusion_mode not in {"learned", "fixed"}:
-            raise ValueError("fusion.mode must be 'learned' or 'fixed'")
+        if self.fusion_mode not in {"learned", "fixed", "reliability"}:
+            raise ValueError("fusion.mode must be 'learned', 'fixed', or 'reliability'")
         fixed_weights = torch.tensor(
             get(config, "fusion.fixed_weights", [0.25, 0.25, 0.5]),
             dtype=torch.float32,
@@ -143,7 +143,22 @@ class PHGeoFuse(nn.Module):
         )
         self.ec_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 7))
         self.gate = nn.Sequential(nn.Linear(6, 64), nn.SiLU(), nn.Dropout(0.1), nn.Linear(64, 3))
-        if self.fusion_mode == "fixed":
+        self.reliability_gate = None
+        self.gate_temperature = float(get(config, "fusion.gate_temperature", 1.0))
+        if self.gate_temperature <= 0:
+            raise ValueError("fusion.gate_temperature must be positive")
+        if self.fusion_mode == "reliability":
+            gate_hidden_dim = int(get(config, "fusion.gate_hidden_dim", 32))
+            gate_dropout = float(get(config, "fusion.gate_dropout", 0.1))
+            if gate_hidden_dim <= 0 or not 0 <= gate_dropout < 1:
+                raise ValueError("reliability gate hidden dimension and dropout are invalid")
+            self.reliability_gate = nn.Sequential(
+                nn.Linear(15, gate_hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(gate_dropout),
+                nn.Linear(gate_hidden_dim, 3),
+            )
+        if self.fusion_mode != "learned":
             self.gate.requires_grad_(False)
 
     def _initialize_lora(self, config, device):
@@ -208,9 +223,10 @@ class PHGeoFuse(nn.Module):
         pooled = scatter_mean(hidden, batch["graph_index"], int(batch["lengths"].shape[0]))
         ec_logits = self.ec_head(pooled)
         retrieval = batch["retrieval"]
-        gate_features = torch.stack(
+        reliability_context = torch.stack(
             [retrieval[:, 2], retrieval[:, 3], retrieval[:, 4], retrieval[:, 5], retrieval[:, 6], global_variance], dim=-1
         )
+        expert_means = torch.stack([global_mean, retrieval[:, 0], retrieval[:, 1]], dim=-1)
         available = torch.stack(
             [torch.ones_like(retrieval[:, 7]), retrieval[:, 7], retrieval[:, 8]], dim=-1
         ).bool()
@@ -225,11 +241,33 @@ class PHGeoFuse(nn.Module):
             gate_weights = self.fixed_gate_weights.to(hidden).expand(len(available), -1)
             gate_weights = gate_weights * available.to(gate_weights.dtype)
             gate_weights = gate_weights / gate_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        elif self.fusion_mode == "reliability":
+            disagreements = torch.stack(
+                [
+                    (expert_means[:, 0] - expert_means[:, 1]).abs(),
+                    (expert_means[:, 0] - expert_means[:, 2]).abs(),
+                    (expert_means[:, 1] - expert_means[:, 2]).abs(),
+                ],
+                dim=-1,
+            )
+            gate_features = torch.cat(
+                [
+                    reliability_context,
+                    expert_means,
+                    disagreements,
+                    available.to(expert_means.dtype),
+                ],
+                dim=-1,
+            ).detach()
+            gate_logits = self.reliability_gate(gate_features)
+            gate_logits = gate_logits.masked_fill(
+                ~available, torch.finfo(gate_logits.dtype).min
+            )
+            gate_weights = torch.softmax(gate_logits / self.gate_temperature, dim=-1)
         else:
-            gate_logits = self.gate(gate_features)
+            gate_logits = self.gate(reliability_context)
             gate_logits = gate_logits.masked_fill(~available, torch.finfo(gate_logits.dtype).min)
             gate_weights = torch.softmax(gate_logits, dim=-1)
-        expert_means = torch.stack([global_mean, retrieval[:, 0], retrieval[:, 1]], dim=-1)
         mean = (gate_weights * expert_means).sum(dim=-1)
         expert_variances = torch.stack([global_variance, retrieval[:, 5], retrieval[:, 6]], dim=-1)
         variance = (gate_weights * (expert_variances + (expert_means - mean.unsqueeze(-1)).square())).sum(dim=-1)
@@ -241,6 +279,8 @@ class PHGeoFuse(nn.Module):
             "variance": variance,
             "ec_logits": ec_logits,
             "gate_weights": gate_weights,
+            "expert_means": expert_means,
+            "expert_available": available,
             "coords": updated_coords,
         }
 
@@ -271,11 +311,52 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, Any], config
     if valid_ec.any():
         ec_loss = F.cross_entropy(outputs["ec_logits"][valid_ec], batch["ec_labels"][valid_ec])
     total = primary + float(get(config, "loss.ec_weight", 0.1)) * ec_loss
-    return total, {
+    components = {
         "mse": mse_loss.mean().detach(),
         "distribution": weighted_distribution.detach(),
         "ec": ec_loss.detach(),
     }
+    gate_supervision_weight = float(get(config, "loss.gate_supervision_weight", 0.0))
+    gate_prior_weight = float(get(config, "loss.gate_prior_weight", 0.0))
+    if gate_supervision_weight > 0 or gate_prior_weight > 0:
+        if "expert_means" not in outputs or "expert_available" not in outputs:
+            raise ValueError("supervised gate loss requires expert predictions and availability")
+        gate_weights = outputs["gate_weights"].clamp_min(1e-8)
+        available = outputs["expert_available"].bool()
+        target_temperature = float(get(config, "loss.gate_target_temperature", 0.3))
+        if target_temperature <= 0:
+            raise ValueError("loss.gate_target_temperature must be positive")
+        expert_errors = (
+            outputs["expert_means"].detach() - labels.unsqueeze(-1)
+        ).abs()
+        target_logits = -expert_errors / target_temperature
+        target_logits = target_logits.masked_fill(
+            ~available, torch.finfo(target_logits.dtype).min
+        )
+        gate_targets = torch.softmax(target_logits, dim=-1)
+        gate_supervision = -(gate_targets * gate_weights.log()).sum(dim=-1).mean()
+
+        gate_prior = torch.as_tensor(
+            get(config, "fusion.gate_prior", [0.25, 0.25, 0.5]),
+            dtype=gate_weights.dtype,
+            device=gate_weights.device,
+        )
+        if gate_prior.shape != (3,) or bool((gate_prior < 0).any()) or float(gate_prior.sum()) <= 0:
+            raise ValueError("fusion.gate_prior must contain three non-negative values")
+        gate_prior = gate_prior.expand_as(gate_weights) * available.to(gate_weights.dtype)
+        gate_prior = gate_prior / gate_prior.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        gate_prior = gate_prior.clamp_min(1e-8)
+        gate_prior_loss = (
+            gate_weights * (gate_weights.log() - gate_prior.log())
+        ).sum(dim=-1).mean()
+        total = (
+            total
+            + gate_supervision_weight * gate_supervision
+            + gate_prior_weight * gate_prior_loss
+        )
+        components["gate_supervision"] = gate_supervision.detach()
+        components["gate_prior"] = gate_prior_loss.detach()
+    return total, components
 
 
 def _pad_hidden(hidden, graph_index, lengths):
