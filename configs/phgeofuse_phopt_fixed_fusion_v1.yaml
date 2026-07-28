@@ -4,6 +4,11 @@ data:
     train: data/phopt_training.fasta
     validation: data/phopt_validation.fasta
     test: data/phopt_testing.fasta
+  subsets:
+    test_low_identity:
+      source_split: test
+      fasta: data/phopt_testing_low_identity.fasta
+      expected_count: 999
 
 paths:
   manifest: artifacts/phgeofuse/manifest.csv

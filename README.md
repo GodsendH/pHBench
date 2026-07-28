@@ -39,18 +39,48 @@ pip install -r requirements.txt
 
 ### Data Preparation
 
+Build the homology-controlled PHOPT datasets with MMseqs2. Identity and
+coverage accept either fractions or percentages. Exact-sequence groups whose
+pHopt range exceeds `0.25` are excluded; the remaining duplicate groups use
+their median pHopt label.
+
+```bash
+conda activate phbench
+python scripts/build_homology_datasets.py \
+    --identity 100 50 30 20 \
+    --coverage 80 \
+    --label-conflict-threshold 0.25
+```
+
+The generated datasets are stored under `data/datasets/<dataset>/`:
+
+| Dataset | Train | Validation | Test | Homology clusters |
+| --- | ---: | ---: | ---: | ---: |
+| `identity100` | 7,046 | 749 | 1,950 | 9,734 |
+| `identity50` | 7,031 | 765 | 1,949 | 6,189 |
+| `identity30` | 6,936 | 846 | 1,963 | 3,917 |
+| `identity20` | 6,853 | 913 | 1,979 | 3,252 |
+
+Each directory includes the split FASTA files, `records.tsv`, `clusters.tsv`,
+`duplicate_conflicts.tsv`, and `metadata.json`. The builder uses all-vs-all
+MMseqs2 search followed by connected components and verifies train-validation,
+train-test, and validation-test separation before publishing a dataset.
+
 Prepare sequence retrieval data using different strategies:
 
 ```bash
 python retrieval.py \
-    --opt_train data/phopt_training.fasta \
-    --opt_test data/phopt_testing.fasta \
-    --opt_valid data/phopt_validation.fasta \
+    --dataset identity20 \
     --model_name facebook/esm2_t33_650M_UR50D \
-    --features_dir data/features \
     --strategy opt_retrieval \
     --topk 5
 ```
+
+Available dataset names are `phopt`, `identity100`, `identity50`, `identity30`,
+and `identity20`. `phopt` preserves the original paths and remains the default.
+Generated retrieval JSON files are isolated under
+`data/processed/<dataset>/`; explicit `--opt_train`, `--opt_valid`,
+`--opt_test`, `--features_dir`, and `--output_dir` still override the defaults.
 
 ### Model Training
 
@@ -62,6 +92,7 @@ Train the model using Model-Agnostic Meta-Learning:
 export LD_LIBRARY_PATH=/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 
 python maml.py \
+    --dataset identity20 \
     --mode train \
     --num_epochs 50 \
     --retrieval_strategy opt_retrieval \
@@ -81,6 +112,7 @@ Train the model on one GPU using the Reptile algorithm:
 
 ```bash
 python reptile.py \
+    --dataset identity20 \
     --mode train \
     --num_epochs 50 \
     --retrieval_strategy opt_retrieval \
@@ -113,6 +145,7 @@ torchrun \
     --nnodes=1 \
     --nproc_per_node=2 \
     reptile.py \
+    --dataset identity20 \
     --mode train \
     --num_epochs 50 \
     --retrieval_strategy opt_retrieval \
@@ -168,6 +201,7 @@ GPUs from the training run.
 - **Mode Options**:
   - `--mode`: train or test
   - `--pretrained`: Use pretrained EpHod RLAT weights; ESM1v is always pretrained
+  - `--dataset`: `phopt`, `identity100`, `identity50`, `identity30`, or `identity20`
 
 - **Retrieval Strategy**:
   - `--retrieval_strategy`:
@@ -230,9 +264,11 @@ python -m phgeofuse.doctor --config configs/phgeofuse_phopt.yaml
 Prepare structures and graph features online, then cache frozen SaProt features:
 
 ```bash
-python -m phgeofuse.prepare --config configs/phgeofuse_phopt.yaml --online
+python -m phgeofuse.prepare --config configs/phgeofuse_phopt.yaml \
+  --dataset identity20 --online
 torchrun --standalone --nproc_per_node=1 \
-  -m phgeofuse.encode --config configs/phgeofuse_phopt.yaml
+  -m phgeofuse.encode --config configs/phgeofuse_phopt.yaml \
+  --dataset identity20
 ```
 
 The preparation command first validates an AlphaFold DB structure against the
@@ -245,12 +281,43 @@ kept constant by automatically changing gradient accumulation with world size.
 
 ```bash
 torchrun --standalone --nproc_per_node=4 \
-  -m phgeofuse.train --config configs/phgeofuse_phopt.yaml
+  -m phgeofuse.train --config configs/phgeofuse_phopt.yaml \
+  --dataset identity20
 
 torchrun --standalone --nproc_per_node=4 \
   -m phgeofuse.evaluate --config configs/phgeofuse_phopt.yaml \
-  --checkpoint artifacts/phgeofuse/runs/phgeofuse_phopt_frozen_seed42/best.pt
+  --dataset identity20 \
+  --checkpoint artifacts/phgeofuse/datasets/identity20/runs/phgeofuse_phopt_mse_frozen_seed42/best.pt
 ```
+
+For homology-controlled datasets, PhGeoFuse stores manifests, retrieval caches,
+predictions, and runs below `artifacts/phgeofuse/datasets/<dataset>/`; structure,
+graph, and SaProt embedding caches remain shared by sequence hash. Use the same
+`--dataset` value for preparation, encoding, training, and evaluation. Omit the
+option to retain the original PHOPT workflow and artifact paths.
+
+Evaluate the official EpHod low-homology benchmark with the dedicated split:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m phgeofuse.evaluate \
+  --config configs/phgeofuse_phopt_tuned_v1.yaml \
+  --checkpoint artifacts/phgeofuse/runs/phgeofuse_phopt_tuned_mse_v1_frozen_seed42/best.pt \
+  --split test_low_identity
+```
+
+The final EpHod paper and its Zenodo metadata define this subset as 999 of the
+1,971 test sequences whose maximum identity to the training set is below 20%.
+The often-cited value 499 is not the size in the final release. The checked-in
+`data/phopt_testing_low_identity.fasta` is generated from the official
+`Test <20% to Train` field in Zenodo record 14252615. Rebuild it with:
+
+```bash
+python scripts/build_ephod_low_identity_subset.py
+```
+
+Subset metrics include requested/evaluated counts, coverage, and unavailable
+IDs so a partially prepared structure manifest cannot silently masquerade as
+the complete 999-sequence benchmark.
 
 For multi-node execution, replace `--standalone` with the normal `torchrun`
 `--nnodes`, `--node_rank`, `--master_addr`, and `--master_port` arguments. All

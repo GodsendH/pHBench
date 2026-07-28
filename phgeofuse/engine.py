@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from .cache import atomic_json, atomic_torch_save
 from .config import config_hash, get, path, save_resolved
 from .dataset import ProteinGraphDataset, collate_graphs, move_batch
+from .io import read_fasta
 from .model import PHGeoFuse, compute_loss
 from .retrieval import RetrievalStore, ensure_retrieval_store
 
@@ -50,10 +51,17 @@ def _restore_rng_state(state):
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def build_loaders(records, retrieval, config, context):
+def build_loaders(records, retrieval, config, context, split_filters=None):
     mode = str(get(config, "model.mode", "frozen"))
+    split_filters = split_filters or {}
     datasets = {
-        split: ProteinGraphDataset(records, split, retrieval, mode)
+        split: ProteinGraphDataset(
+            records,
+            split,
+            retrieval,
+            mode,
+            allowed_protein_ids=split_filters.get(split),
+        )
         for split in ("train", "validation", "test")
     }
     batch_size = int(get(config, "training.per_device_batch_size", 2))
@@ -103,6 +111,79 @@ def build_loaders(records, retrieval, config, context):
             drop_last=False,
         )
     return loaders, train_sampler
+
+
+def resolve_evaluation_split(records, config, requested_split):
+    if requested_split in {"train", "validation", "test"}:
+        return requested_split, None, {}
+
+    subset_config = get(config, f"data.subsets.{requested_split}")
+    if not isinstance(subset_config, dict):
+        raise ValueError(f"evaluation subset is not configured: {requested_split}")
+    source_split = str(subset_config.get("source_split", "test"))
+    if source_split not in {"train", "validation", "test"}:
+        raise ValueError(
+            f"invalid source split for {requested_split}: {source_split}"
+        )
+    subset_records = read_fasta(
+        path(config, f"data.subsets.{requested_split}.fasta"),
+        source_split,
+    )
+    expected_count = int(subset_config.get("expected_count", len(subset_records)))
+    if len(subset_records) != expected_count:
+        raise ValueError(
+            f"{requested_split} must contain {expected_count} records, "
+            f"found {len(subset_records)}"
+        )
+
+    source_records = {
+        record.protein_id: record
+        for record in records
+        if record.split == source_split
+    }
+    unknown_ids = [
+        record.protein_id
+        for record in subset_records
+        if record.protein_id not in source_records
+    ]
+    if unknown_ids:
+        raise ValueError(
+            f"{requested_split} contains IDs outside {source_split}: {unknown_ids[:10]}"
+        )
+    for subset_record in subset_records:
+        source_record = source_records[subset_record.protein_id]
+        if subset_record.sequence != source_record.sequence:
+            raise ValueError(
+                f"sequence mismatch in {requested_split}: {subset_record.protein_id}"
+            )
+        if not math.isclose(
+            subset_record.ph_opt, source_record.ph_opt, rel_tol=0.0, abs_tol=1e-9
+        ):
+            raise ValueError(
+                f"pHopt mismatch in {requested_split}: {subset_record.protein_id}"
+            )
+
+    requested_ids = {record.protein_id for record in subset_records}
+    unavailable_ids = [
+        record.protein_id
+        for record in subset_records
+        if source_records[record.protein_id].status != "ready"
+    ]
+    evaluated_count = len(requested_ids) - len(unavailable_ids)
+    if evaluated_count == 0:
+        raise ValueError(f"{requested_split} has no ready records to evaluate")
+    metadata = {
+        "evaluation_split": requested_split,
+        "source_split": source_split,
+        "subset_expected_count": expected_count,
+        "subset_requested_count": len(requested_ids),
+        "subset_evaluated_count": evaluated_count,
+        "subset_unavailable_count": len(unavailable_ids),
+        "subset_coverage": evaluated_count / len(requested_ids),
+        "subset_complete": not unavailable_ids,
+        "subset_unavailable_ids": unavailable_ids,
+    }
+    return source_split, requested_ids, metadata
 
 
 def train_model(records, config, context, resume: str | Path | None = None):
@@ -296,7 +377,13 @@ def evaluate_loader(model, loader, config, context, include_loss: bool = False):
 
 def evaluate_checkpoint(records, config, checkpoint_path, context, split="test", output=None):
     retrieval = RetrievalStore.load(path(config, "paths.retrieval"))
-    loaders, _ = build_loaders(records, retrieval, config, context)
+    source_split, allowed_ids, evaluation_metadata = resolve_evaluation_split(
+        records, config, split
+    )
+    split_filters = {source_split: allowed_ids} if allowed_ids is not None else None
+    loaders, _ = build_loaders(
+        records, retrieval, config, context, split_filters=split_filters
+    )
     model = PHGeoFuse(config, context.device).to(context.device)
     load_checkpoint(checkpoint_path, model)
     if context.distributed:
@@ -304,8 +391,9 @@ def evaluate_checkpoint(records, config, checkpoint_path, context, split="test",
             model, device_ids=[context.local_rank] if context.device.type == "cuda" else None,
             output_device=context.local_rank if context.device.type == "cuda" else None,
         )
-    result = evaluate_loader(model, loaders[split], config, context)
+    result = evaluate_loader(model, loaders[source_split], config, context)
     if context.is_main:
+        result["metrics"].update(evaluation_metadata)
         destination = Path(output) if output else Path(checkpoint_path).parent / f"{split}_predictions.csv"
         _write_predictions(destination, result["rows"])
         atomic_json(destination.with_suffix(".metrics.json"), result["metrics"])

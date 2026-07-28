@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 
+from dataset_registry import DATASET_CHOICES
+
 from .config import load_config, path
+from .datasets import apply_dataset
 from .engine import apply_ablation, train_model
 from .io import read_manifest
 
@@ -10,12 +13,13 @@ from .io import read_manifest
 def main():
     parser = argparse.ArgumentParser(description="Train pH-GeoFuse with torchrun/DDP")
     parser.add_argument("--config", required=True)
+    parser.add_argument("--dataset", default="phopt", choices=DATASET_CHOICES)
     parser.add_argument("--manifest")
     parser.add_argument("--resume")
     parser.add_argument("--distributed-backend", default="nccl")
     parser.add_argument("--ablation", default="full", choices=["full", "saprot_only", "geometry", "ph_conditioned", "saprot_retrieval"])
     args = parser.parse_args()
-    config = load_config(args.config)
+    config = apply_dataset(load_config(args.config), args.dataset)
     apply_ablation(config, args.ablation)
     manifest = args.manifest or path(config, "paths.manifest")
     records = read_manifest(manifest)

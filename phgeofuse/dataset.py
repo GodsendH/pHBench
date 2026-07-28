@@ -18,8 +18,18 @@ class ProteinGraphDataset(Dataset):
         split: str,
         retrieval: RetrievalStore | None,
         mode: str = "frozen",
+        allowed_protein_ids: set[str] | None = None,
     ):
-        self.records = [record for record in records if record.split == split and record.status == "ready"]
+        self.records = [
+            record
+            for record in records
+            if record.split == split
+            and record.status == "ready"
+            and (
+                allowed_protein_ids is None
+                or record.protein_id in allowed_protein_ids
+            )
+        ]
         self.retrieval = retrieval
         self.mode = mode
 

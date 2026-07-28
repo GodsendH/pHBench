@@ -5,8 +5,11 @@ import math
 from pathlib import Path
 from typing import Iterable
 
+from dataset_registry import DATASET_CHOICES
+
 from .cache import artifact_path, atomic_json, sha256_text
 from .config import config_hash, get, load_config, path
+from .datasets import apply_dataset
 from .graph import GRAPH_SCHEMA_VERSION, build_graph_artifact
 from .io import ProteinRecord, records_from_config, write_manifest
 from .saprot import embedding_cache_path
@@ -72,6 +75,7 @@ def prepare_records(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare pH-GeoFuse structures and graphs")
     parser.add_argument("--config", required=True)
+    parser.add_argument("--dataset", default="phopt", choices=DATASET_CHOICES)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--online", action="store_true")
     mode.add_argument("--offline", action="store_true")
@@ -79,7 +83,7 @@ def main() -> None:
     parser.add_argument("--manifest")
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    config = apply_dataset(load_config(args.config), args.dataset)
     records = records_from_config(config)
     if args.limit is not None:
         records = records[: args.limit]

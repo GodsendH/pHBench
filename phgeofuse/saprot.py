@@ -7,8 +7,11 @@ from typing import Any, Iterable
 
 import torch
 
+from dataset_registry import DATASET_CHOICES
+
 from .cache import artifact_path, atomic_torch_save, sha256_text, valid_torch_cache
 from .config import get, load_config, path
+from .datasets import apply_dataset
 from .io import ProteinRecord, read_manifest, write_manifest
 
 
@@ -148,10 +151,11 @@ def encode_records(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Cache SaProt residue embeddings")
     parser.add_argument("--config", required=True)
+    parser.add_argument("--dataset", default="phopt", choices=DATASET_CHOICES)
     parser.add_argument("--manifest")
     parser.add_argument("--distributed-backend", default="nccl")
     args = parser.parse_args()
-    config = load_config(args.config)
+    config = apply_dataset(load_config(args.config), args.dataset)
     config.setdefault("runtime", {})["offline"] = bool(get(config, "runtime.offline", False))
     manifest = Path(args.manifest).resolve() if args.manifest else path(config, "paths.manifest")
     records = read_manifest(manifest)

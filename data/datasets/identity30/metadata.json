@@ -1,0 +1,33 @@
+{
+  "audit": {
+    "passed": true,
+    "violation_count_capped": 0,
+    "violations": []
+  },
+  "cluster_count": 3917,
+  "cluster_mode": "all_vs_all_search_connected_component",
+  "counts": {
+    "test": 1963,
+    "train": 6936,
+    "validation": 846
+  },
+  "coverage": 0.8,
+  "coverage_mode": 0,
+  "dataset": "identity30",
+  "identity": 0.3,
+  "identity_percent": 30.0,
+  "label_conflict_threshold": 0.25,
+  "largest_cluster": 81,
+  "mmseqs_version": "18.8cc5c",
+  "removed_conflict_groups": 29,
+  "search_sensitivity": 7.5,
+  "seed": 42,
+  "split_attempts": 32,
+  "split_objective": 5.349377882522827,
+  "target_ratios": {
+    "test": 0.2,
+    "train": 0.723,
+    "validation": 0.077
+  },
+  "total_records": 9745
+}

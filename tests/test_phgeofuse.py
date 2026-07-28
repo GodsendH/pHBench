@@ -11,6 +11,7 @@ import torch
 from phgeofuse.cache import atomic_torch_save, valid_torch_cache
 from phgeofuse.chemistry import henderson_hasselbalch_charge
 from phgeofuse.config import load_config
+from phgeofuse.dataset import ProteinGraphDataset
 from phgeofuse.graph import build_edges, graph_feature_dim
 from phgeofuse.io import ProteinRecord, parse_phopt_header, read_fasta, read_manifest
 from phgeofuse.model import PHGeoFuse, compute_loss
@@ -21,7 +22,7 @@ from phgeofuse.structures import (
     select_chain,
     sequence_matches,
 )
-from phgeofuse.engine import load_checkpoint, train_model
+from phgeofuse.engine import load_checkpoint, resolve_evaluation_split, train_model
 from utils.distributed import DistributedContext
 
 
@@ -35,6 +36,72 @@ class PHGeoFuseTests(unittest.TestCase):
         self.assertEqual(records[0].sequence, "ACDE")
         self.assertEqual(records[0].ph_opt, 7.5)
         self.assertEqual(parse_phopt_header(">A | B | 1.1.1.1 | 6 | 1")[0], "A")
+
+    def test_ephod_low_identity_subset_matches_test_fasta(self):
+        root = Path(__file__).resolve().parents[1]
+        full_test = {
+            record.protein_id: record
+            for record in read_fasta(root / "data" / "phopt_testing.fasta", "test")
+        }
+        subset = read_fasta(
+            root / "data" / "phopt_testing_low_identity.fasta", "test"
+        )
+
+        self.assertEqual(len(subset), 999)
+        self.assertEqual(len({record.protein_id for record in subset}), 999)
+        for record in subset:
+            self.assertIn(record.protein_id, full_test)
+            self.assertEqual(record.sequence, full_test[record.protein_id].sequence)
+            self.assertEqual(record.ph_opt, full_test[record.protein_id].ph_opt)
+
+    def test_low_identity_evaluation_reports_incomplete_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subset = root / "subset.fasta"
+            subset.write_text(
+                ">P1 | Organism | 1.1.1.1 | 6.0 | 1.0\nACD\n"
+                ">P2 | Organism | 1.1.1.1 | 8.0 | 1.0\nEFG\n"
+            )
+            records = [
+                ProteinRecord(
+                    protein_id="P1", sequence="ACD", split="test", ph_opt=6.0,
+                    status="ready",
+                ),
+                ProteinRecord(
+                    protein_id="P2", sequence="EFG", split="test", ph_opt=8.0,
+                    status="failed",
+                ),
+            ]
+            config = {
+                "_root": str(root),
+                "data": {
+                    "subsets": {
+                        "test_low_identity": {
+                            "source_split": "test",
+                            "fasta": "subset.fasta",
+                            "expected_count": 2,
+                        }
+                    }
+                },
+            }
+
+            source_split, allowed_ids, metadata = resolve_evaluation_split(
+                records, config, "test_low_identity"
+            )
+            dataset = ProteinGraphDataset(
+                records,
+                source_split,
+                retrieval=None,
+                allowed_protein_ids=allowed_ids,
+            )
+
+        self.assertEqual(source_split, "test")
+        self.assertEqual(allowed_ids, {"P1", "P2"})
+        self.assertEqual([record.protein_id for record in dataset.records], ["P1"])
+        self.assertEqual(metadata["subset_requested_count"], 2)
+        self.assertEqual(metadata["subset_evaluated_count"], 1)
+        self.assertEqual(metadata["subset_unavailable_ids"], ["P2"])
+        self.assertFalse(metadata["subset_complete"])
 
     def test_minimal_manifest_preserves_optional_defaults(self):
         with tempfile.TemporaryDirectory() as directory:

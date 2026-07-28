@@ -10,6 +10,9 @@ import json
 import argparse
 import logging
 from collections import defaultdict
+from pathlib import Path
+
+from dataset_registry import DATASET_CHOICES, dataset_fasta_paths, normalize_dataset_name
 
 def encode_sequences_batch(sequences, tokenizer, model, device, batch_size=32):
     """Encode sequences in batches"""
@@ -356,19 +359,34 @@ def process_dataset(opt_file,  output_json, tokenizer, model, device, topk=5,
 
 def main():
     parser = argparse.ArgumentParser(description="Process protein sequences and find similar environmental sequences.")
-    parser.add_argument("--opt_train", default="data/phopt_training.fasta", help="Path to the OPT training FASTA file")
-    parser.add_argument("--opt_test", default="data/phopt_testing.fasta", help="Path to the OPT testing FASTA file")
-    parser.add_argument("--opt_valid", default="data/phopt_validation.fasta", help="Path to the OPT validation FASTA file")
-    parser.add_argument("--output_dir", default="data/processed", help="Base directory to save output JSON files")
+    parser.add_argument("--dataset", default="phopt", choices=DATASET_CHOICES)
+    parser.add_argument("--opt_train", help="Path to the OPT training FASTA file")
+    parser.add_argument("--opt_test", help="Path to the OPT testing FASTA file")
+    parser.add_argument("--opt_valid", help="Path to the OPT validation FASTA file")
+    parser.add_argument("--output_dir", help="Base directory to save output JSON files")
     parser.add_argument("--topk", type=int, default=5, help="Number of similar sequences to retrieve")
     parser.add_argument("--batch_size", type=int, default=100, help="Size of batches for processing")
-    parser.add_argument("--features_dir", default="data/features", help="Directory to save feature files")
+    parser.add_argument("--features_dir", help="Directory to save feature files")
     parser.add_argument("--model_name", default="path_to/facebook/esm2_t33_650M_UR50D", help="Path to the ESM2 model")
     parser.add_argument("--strategy", default="opt_retrieval", 
                        choices=["opt_retrieval", "opt_random", "opt_fixed_random",
                                "opt_retrieval_scaled_0.2","opt_retrieval_scaled_0.6"],  
                                 help="Retrieval strategy to use")
     args = parser.parse_args()
+
+    project_root = Path(__file__).resolve().parent
+    args.dataset = normalize_dataset_name(args.dataset)
+    split_paths = dataset_fasta_paths(project_root, args.dataset)
+    args.opt_train = args.opt_train or str(split_paths["train"])
+    args.opt_valid = args.opt_valid or str(split_paths["validation"])
+    args.opt_test = args.opt_test or str(split_paths["test"])
+    processed_root = project_root / "data" / "processed"
+    features_root = project_root / "data" / "features"
+    if args.dataset != "phopt":
+        processed_root /= args.dataset
+        features_root /= args.dataset
+    args.output_dir = args.output_dir or str(processed_root)
+    args.features_dir = args.features_dir or str(features_root)
 
     # Set up logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

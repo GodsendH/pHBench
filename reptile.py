@@ -1,5 +1,6 @@
 import argparse
 import os
+from pathlib import Path
 
 import pandas as pd
 import torch
@@ -9,6 +10,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from dataset_registry import DATASET_CHOICES, normalize_dataset_name, processed_dataset_directory
 from models import pHPredictionModel, ProteinpHDataset, SupportDataset
 from utils import (
     BaseTrainer,
@@ -24,6 +26,7 @@ from utils import (
 )
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
 LOGGING_INTERVAL = 10
 
 
@@ -338,12 +341,14 @@ class ReptileTrainer(BaseTrainer):
 
 def get_run_name(args, world_size=1):
     pretrained_int = 1 if args.pretrained else 0
+    dataset_suffix = '' if args.dataset == 'phopt' else f'_{args.dataset}'
     return (
         f'reptile_{args.retrieval_strategy}_topk{args.topk}'
         f'_mlr{args.meta_lr}_ilr{args.inner_lr}_ep{args.num_epochs}'
         f'_ve{args.validate_every}_pr{pretrained_int}_pt{int(args.patience)}'
         f'_is{args.inner_steps}_sbs{args.support_batch_size}'
         f'_gbs{args.meta_batch_size}_seed{args.seed}_ws{world_size}'
+        f'{dataset_suffix}'
     )
 
 
@@ -359,6 +364,7 @@ def create_data_loader_kwargs(args, device):
 
 
 def main(args):
+    args.dataset = normalize_dataset_name(args.dataset)
     distributed_context = initialize_distributed(args.distributed_backend)
     writer = None
 
@@ -382,26 +388,26 @@ def main(args):
         else:
             writer = NullSummaryWriter()
 
-        data_dir = os.path.join(
-            'data/processed',
-            f'top{args.topk}',
-            f'esm2_{args.retrieval_strategy}',
+        data_dir = processed_dataset_directory(
+            PROJECT_ROOT,
+            args.dataset,
+            args.topk,
+            args.retrieval_strategy,
         )
         train_dataset = ProteinpHDataset(
-            os.path.join(data_dir, 'retrieval_train.json'),
+            data_dir / 'retrieval_train.json',
             verbose=distributed_context.is_main,
         )
         valid_dataset = ProteinpHDataset(
-            os.path.join(data_dir, 'retrieval_valid.json'),
+            data_dir / 'retrieval_valid.json',
             verbose=distributed_context.is_main,
         )
         if args.random_test:
-            test_path = os.path.join(
-                'data/processed/top5/esm2_opt_random',
-                'retrieval_test.json',
-            )
+            test_path = processed_dataset_directory(
+                PROJECT_ROOT, args.dataset, 5, 'opt_random'
+            ) / 'retrieval_test.json'
         else:
-            test_path = os.path.join(data_dir, 'retrieval_test.json')
+            test_path = data_dir / 'retrieval_test.json'
         test_dataset = ProteinpHDataset(
             test_path,
             verbose=distributed_context.is_main,
@@ -511,6 +517,7 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Reptile pH Prediction Model')
+    parser.add_argument('--dataset', default='phopt', choices=DATASET_CHOICES)
     parser.add_argument('--mode', default='train', choices=['train', 'test'])
     parser.add_argument('--pretrained', action='store_true')
     parser.add_argument('--meta_lr', type=float, default=1)

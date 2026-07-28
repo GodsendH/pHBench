@@ -8,8 +8,10 @@ from torch import nn
 from torch.utils.data import DataLoader
 import time
 import argparse
+from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 
+from dataset_registry import DATASET_CHOICES, normalize_dataset_name, processed_dataset_directory
 from models import pHPredictionModel, ProteinpHDataset, SupportDataset
 from utils import (
     BaseTrainer,
@@ -20,6 +22,7 @@ from utils import (
     seed_worker,
 )
 
+PROJECT_ROOT = Path(__file__).resolve().parent
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LOGGING_INTERVAL = 10
 
@@ -161,14 +164,17 @@ class MAMLTrainer(BaseTrainer):
 def get_run_name(args):
     """Generate a unique run name containing key configuration parameters"""
     pretrained_int = 1 if args.pretrained else 0
+    dataset_suffix = "" if args.dataset == "phopt" else f"_{args.dataset}"
     return (
         f"maml_{args.retrieval_strategy}_topk{args.topk}"
         f"_mlr{args.meta_lr}_ilr{args.inner_lr}_ep{args.num_epochs}"
         f"_ve{args.validate_every}_pr{pretrained_int}_pt{int(args.patience)}"
         f"_is{args.inner_steps}_sbs{args.support_batch_size}_seed{args.seed}"
+        f"{dataset_suffix}"
     )
 
 def main(args):
+    args.dataset = normalize_dataset_name(args.dataset)
     seed_everything(args.seed)
     run_name = get_run_name(args)
     args.save_dir = os.path.join(args.save_dir, run_name)
@@ -178,13 +184,18 @@ def main(args):
     writer = SummaryWriter(log_dir=args.log_dir)
 
     # Load datasets
-    data_dir = os.path.join('data/processed', f'top{args.topk}', f'esm2_{args.retrieval_strategy}')
-    train_dataset = ProteinpHDataset(os.path.join(data_dir, 'retrieval_train.json'))
-    valid_dataset = ProteinpHDataset(os.path.join(data_dir, 'retrieval_valid.json'))
+    data_dir = processed_dataset_directory(
+        PROJECT_ROOT, args.dataset, args.topk, args.retrieval_strategy
+    )
+    train_dataset = ProteinpHDataset(data_dir / 'retrieval_train.json')
+    valid_dataset = ProteinpHDataset(data_dir / 'retrieval_valid.json')
     if args.random_test:
-        test_dataset = ProteinpHDataset(os.path.join('data/processed/top5/esm2_opt_random', 'retrieval_test.json'))
+        random_dir = processed_dataset_directory(
+            PROJECT_ROOT, args.dataset, 5, 'opt_random'
+        )
+        test_dataset = ProteinpHDataset(random_dir / 'retrieval_test.json')
     else:
-        test_dataset = ProteinpHDataset(os.path.join(data_dir, 'retrieval_test.json'))
+        test_dataset = ProteinpHDataset(data_dir / 'retrieval_test.json')
 
     # Create dataloaders
     train_loader = DataLoader(
@@ -240,6 +251,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MAML pH Prediction Model")
+    parser.add_argument('--dataset', default='phopt', choices=DATASET_CHOICES)
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
     parser.add_argument('--pretrained', action='store_true')
     parser.add_argument('--meta_lr', type=float, default=0.0001)
