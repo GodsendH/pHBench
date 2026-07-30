@@ -22,8 +22,8 @@ from .cache import atomic_json, atomic_torch_save
 from .config import config_hash, get, path, save_resolved
 from .dataset import ProteinGraphDataset, collate_graphs, move_batch
 from .io import read_fasta
-from .model import PHGeoFuse, compute_loss
-from .retrieval import RetrievalStore, ensure_retrieval_store
+from .model import PHGeoFuse, compute_dual_view_loss, compute_loss
+from .retrieval import RetrievalStore, ensure_retrieval_store, homology_training_enabled
 
 
 def seed_everything(seed: int) -> None:
@@ -186,7 +186,15 @@ def resolve_evaluation_split(records, config, requested_split):
     return source_split, requested_ids, metadata
 
 
-def train_model(records, config, context, resume: str | Path | None = None):
+def train_model(
+    records,
+    config,
+    context,
+    resume: str | Path | None = None,
+    init_checkpoint: str | Path | None = None,
+):
+    if resume and init_checkpoint:
+        raise ValueError("resume and init_checkpoint are mutually exclusive")
     seed = int(get(config, "training.seed", 42))
     seed_everything(seed + context.rank)
     retrieval_path = path(config, "paths.retrieval", "artifacts/phgeofuse/retrieval.pt")
@@ -199,6 +207,9 @@ def train_model(records, config, context, resume: str | Path | None = None):
         raise ValueError("training and validation splits must both contain ready proteins")
 
     model = PHGeoFuse(config, context.device).to(context.device)
+    if init_checkpoint:
+        load_initial_checkpoint(init_checkpoint, model)
+    _configure_trainable_scope(model, config, resume=resume, init_checkpoint=init_checkpoint)
     if context.distributed:
         model = DistributedDataParallel(
             model,
@@ -236,21 +247,39 @@ def train_model(records, config, context, resume: str | Path | None = None):
     for epoch in range(start_epoch, epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        model.train()
+        _set_training_mode(model, config)
         optimizer.zero_grad(set_to_none=True)
         running_loss, sample_count = 0.0, 0
+        running_component_sums: dict[str, float] = {}
         for batch_index, raw_batch in enumerate(loaders["train"]):
             batch = move_batch(raw_batch, context.device)
             synchronize = (batch_index + 1) % accumulation == 0 or batch_index + 1 == len(loaders["train"])
             sync_context = nullcontext() if synchronize or not context.distributed else model.no_sync()
             with sync_context:
                 with _autocast(context.device, amp_dtype):
-                    outputs = model(batch)
-                    loss, _ = compute_loss(outputs, batch, config)
+                    if homology_training_enabled(config):
+                        outputs = model(
+                            batch,
+                            retrieval_views={
+                                "normal": batch["retrieval"],
+                                "low_homology": batch["low_homology_retrieval"],
+                            },
+                        )
+                        loss, components = compute_dual_view_loss(
+                            outputs, batch, config
+                        )
+                    else:
+                        outputs = model(batch)
+                        loss, components = compute_loss(outputs, batch, config)
                     scaled_loss = loss / accumulation
                 scaler.scale(scaled_loss).backward()
             running_loss += float(loss.detach()) * len(batch["labels"])
             sample_count += len(batch["labels"])
+            for name, value in components.items():
+                running_component_sums[name] = (
+                    running_component_sums.get(name, 0.0)
+                    + float(value) * len(batch["labels"])
+                )
             if synchronize:
                 scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), clip)
@@ -260,6 +289,10 @@ def train_model(records, config, context, resume: str | Path | None = None):
                 scheduler.step()
                 global_step += 1
         train_loss = _global_average(running_loss, sample_count, context.device)
+        train_loss_components = {
+            name: _global_average(value, sample_count, context.device)
+            for name, value in running_component_sums.items()
+        }
         validation = evaluate_loader(model, loaders["validation"], config, context, include_loss=True)
         train_evaluation = None
         if "train_evaluation" in loaders:
@@ -282,6 +315,7 @@ def train_model(records, config, context, resume: str | Path | None = None):
         if context.is_main:
             row = {
                 "epoch": epoch, "global_step": global_step, "train_loss": train_loss,
+                "train_loss_components": train_loss_components,
                 "validation": validation["metrics"], "best_rmse": best_rmse,
                 "learning_rate": optimizer.param_groups[0]["lr"],
                 "validation_loss": validation["loss"],
@@ -358,12 +392,19 @@ def evaluate_loader(model, loader, config, context, include_loss: bool = False):
                         "global_gate": float(outputs["gate_weights"][index, 0]),
                         "saprot_gate": float(outputs["gate_weights"][index, 1]),
                         "foldseek_gate": float(outputs["gate_weights"][index, 2]),
+                        "sequence_identity": float(retrieval[4]),
+                        "query_coverage": float(retrieval[9]),
+                        "target_coverage": float(retrieval[10]),
+                        "saprot_hit_fraction": float(retrieval[11]),
+                        "foldseek_hit_fraction": float(retrieval[12]),
+                        "saprot_similarity_margin": float(retrieval[13]),
+                        "foldseek_similarity_margin": float(retrieval[14]),
                     }
                 )
     rows = _gather_rows(local_rows, context)
     result = {"rows": rows if context.is_main else []}
     if context.is_main:
-        result["metrics"] = prediction_metrics(rows)
+        result["metrics"] = prediction_metrics(rows, config)
     else:
         result["metrics"] = {}
     if include_loss:
@@ -437,7 +478,7 @@ def ph_bin_metrics(labels, predictions):
     return result
 
 
-def prediction_metrics(rows):
+def prediction_metrics(rows, config=None):
     labels = np.asarray([row["label"] for row in rows])
     predictions = np.asarray([row["prediction"] for row in rows])
     metrics = regression_metrics(labels, predictions)
@@ -496,6 +537,40 @@ def prediction_metrics(rows):
     metrics["uncertainty_absolute_error_corr"] = _safe_pearson(
         uncertainty, np.abs(predictions - labels)
     )
+    identities = np.asarray([row.get("sequence_identity", 0.0) for row in rows])
+    query_coverage = np.asarray([row.get("query_coverage", 0.0) for row in rows])
+    target_coverage = np.asarray([row.get("target_coverage", 0.0) for row in rows])
+    metrics["mean_sequence_identity"] = float(identities.mean())
+    metrics["mean_query_coverage"] = float(query_coverage.mean())
+    metrics["mean_target_coverage"] = float(target_coverage.mean())
+    for name in (
+        "saprot_hit_fraction",
+        "foldseek_hit_fraction",
+        "saprot_similarity_margin",
+        "foldseek_similarity_margin",
+    ):
+        metrics[f"mean_{name}"] = float(
+            np.asarray([row.get(name, 0.0) for row in rows]).mean()
+        )
+    config = config or {}
+    if homology_training_enabled(config):
+        low_identity = float(get(config, "retrieval.low_homology_identity", 0.2))
+        low_coverage = float(get(config, "retrieval.low_homology_coverage", 0.8))
+        if low_identity > 1.0:
+            low_identity /= 100.0
+        if low_coverage > 1.0:
+            low_coverage /= 100.0
+        low_mask = ~(
+            (identities >= low_identity)
+            & (query_coverage >= low_coverage)
+            & (target_coverage >= low_coverage)
+        )
+        metrics["low_homology_count"] = int(low_mask.sum())
+        if low_mask.any():
+            for name, value in regression_metrics(
+                labels[low_mask], predictions[low_mask]
+            ).items():
+                metrics[f"low_homology_{name}"] = value
     return metrics
 
 
@@ -555,6 +630,54 @@ def load_checkpoint(source, model, optimizer=None, scheduler=None, scaler=None):
     return payload
 
 
+def load_initial_checkpoint(source, model):
+    payload = torch.load(source, map_location="cpu")
+    if payload.get("saprot_adapter_only", False):
+        raise RuntimeError("init_checkpoint does not support adapter-only checkpoints")
+    module = model.module if hasattr(model, "module") else model
+    incompatible = module.load_state_dict(payload["model_state_dict"], strict=False)
+    invalid_missing = [
+        name for name in incompatible.missing_keys
+        if not name.startswith("homology_gate.")
+    ]
+    if invalid_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "invalid initialization checkpoint: "
+            f"missing={invalid_missing}, unexpected={list(incompatible.unexpected_keys)}"
+        )
+    return payload
+
+
+def _configure_trainable_scope(model, config, *, resume=None, init_checkpoint=None):
+    scope = str(get(config, "training.trainable_scope", "all")).lower()
+    if scope == "all":
+        return
+    if scope != "homology_gate":
+        raise ValueError("training.trainable_scope must be 'all' or 'homology_gate'")
+    if not resume and not init_checkpoint:
+        raise ValueError(
+            "training.trainable_scope=homology_gate requires --init-checkpoint or --resume"
+        )
+    module = model.module if hasattr(model, "module") else model
+    if module.fusion_mode != "homology_reliability" or module.homology_gate is None:
+        raise ValueError(
+            "homology_gate scope requires fusion.mode=homology_reliability"
+        )
+    for parameter in module.parameters():
+        parameter.requires_grad_(False)
+    module.homology_gate.requires_grad_(True)
+
+
+def _set_training_mode(model, config):
+    scope = str(get(config, "training.trainable_scope", "all")).lower()
+    if scope == "all":
+        model.train()
+        return
+    model.eval()
+    module = model.module if hasattr(model, "module") else model
+    module.homology_gate.train()
+
+
 def apply_ablation(config: dict[str, Any], name: str) -> None:
     ablation = config.setdefault("ablation", {})
     ablation.update({"disable_structural_features": False, "disable_ph_conditioning": False,
@@ -577,7 +700,13 @@ def _optimizer(model, config):
         if not parameter.requires_grad:
             continue
         (lora if "lora_" in name else other).append(parameter)
-    groups = [{"params": other, "lr": float(get(config, "training.learning_rate", 3e-4))}]
+    if not other and not lora:
+        raise ValueError("training configuration does not leave any trainable parameters")
+    groups = []
+    if other:
+        groups.append(
+            {"params": other, "lr": float(get(config, "training.learning_rate", 3e-4))}
+        )
     if lora:
         groups.append({"params": lora, "lr": float(get(config, "training.lora_learning_rate", 1e-5))})
     return AdamW(groups, weight_decay=float(get(config, "training.weight_decay", 1e-2)))

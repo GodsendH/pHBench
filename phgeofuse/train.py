@@ -15,7 +15,9 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--dataset", default="phopt", choices=DATASET_CHOICES)
     parser.add_argument("--manifest")
-    parser.add_argument("--resume")
+    checkpoint = parser.add_mutually_exclusive_group()
+    checkpoint.add_argument("--resume")
+    checkpoint.add_argument("--init-checkpoint")
     parser.add_argument("--distributed-backend", default="nccl")
     parser.add_argument("--ablation", default="full", choices=["full", "saprot_only", "geometry", "ph_conditioned", "saprot_retrieval"])
     args = parser.parse_args()
@@ -26,7 +28,13 @@ def main():
     from utils.distributed import initialize_distributed
     context = initialize_distributed(args.distributed_backend)
     try:
-        checkpoint = train_model(records, config, context, args.resume)
+        checkpoint = train_model(
+            records,
+            config,
+            context,
+            resume=args.resume,
+            init_checkpoint=args.init_checkpoint,
+        )
         if context.is_main:
             print(f"Best checkpoint: {checkpoint}")
     finally:

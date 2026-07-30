@@ -14,15 +14,32 @@ from phgeofuse.config import load_config
 from phgeofuse.dataset import ProteinGraphDataset
 from phgeofuse.graph import build_edges, graph_feature_dim
 from phgeofuse.io import ProteinRecord, parse_phopt_header, read_fasta, read_manifest
-from phgeofuse.model import PHGeoFuse, compute_loss
-from phgeofuse.retrieval import RetrievalStore, record_key
+from phgeofuse.model import PHGeoFuse, compute_dual_view_loss, compute_loss
+from phgeofuse.retrieval import (
+    RETRIEVAL_FEATURE_DIM,
+    RetrievalStore,
+    SequenceHit,
+    _aggregate_retrieval_view,
+    _is_low_homology_pair,
+    _safe_key,
+    ensure_retrieval_store,
+    record_key,
+    retrieval_build_signature,
+)
 from phgeofuse.structures import (
     acquire_structure,
     foldseek_three_di,
     select_chain,
     sequence_matches,
 )
-from phgeofuse.engine import load_checkpoint, resolve_evaluation_split, train_model
+from phgeofuse.engine import (
+    _configure_trainable_scope,
+    _set_training_mode,
+    load_checkpoint,
+    load_initial_checkpoint,
+    resolve_evaluation_split,
+    train_model,
+)
 from utils.distributed import DistributedContext
 
 
@@ -222,6 +239,142 @@ class PHGeoFuseTests(unittest.TestCase):
             first = store.rows[record_key(records[0])]
         self.assertAlmostEqual(first["saprot_value"], 9.0)
 
+    def test_v1_retrieval_rows_expand_to_v2_features(self):
+        row = {
+            "saprot_value": 6.5,
+            "foldseek_value": 7.0,
+            "identity": 0.3,
+            "saprot_available": True,
+        }
+        store = RetrievalStore({"schema_version": "1", "rows": {"test::P": row}})
+
+        normal = store.features("test::P")
+        low = store.features("test::P", view="low_homology")
+
+        self.assertEqual(normal.shape, (RETRIEVAL_FEATURE_DIM,))
+        torch.testing.assert_close(normal, low)
+        self.assertEqual(float(normal[0]), 6.5)
+        self.assertEqual(float(normal[9]), 0.0)
+
+    def test_low_homology_filter_matches_identity20_boundary(self):
+        query = ProteinRecord("Q", "A" * 10, "train")
+        target = ProteinRecord("T", "C" * 10, "train")
+        key = (_safe_key(query), _safe_key(target))
+        config = {
+            "retrieval": {
+                "low_homology_identity": 0.2,
+                "low_homology_coverage": 0.8,
+                "low_homology_coverage_mode": 0,
+            }
+        }
+
+        self.assertFalse(
+            _is_low_homology_pair(
+                query, target, {key: SequenceHit(0.2, 0.8, 0.8, 10.0)}, config
+            )
+        )
+        self.assertTrue(
+            _is_low_homology_pair(
+                query, target, {key: SequenceHit(0.199, 0.8, 0.8, 10.0)}, config
+            )
+        )
+        self.assertTrue(
+            _is_low_homology_pair(
+                query, target, {key: SequenceHit(0.2, 0.79, 0.8, 10.0)}, config
+            )
+        )
+        self.assertTrue(_is_low_homology_pair(query, target, {}, config))
+
+    def test_low_homology_view_filters_high_identity_candidates(self):
+        query = ProteinRecord("Q", "A" * 10, "train")
+        high = ProteinRecord("H", "A" * 10, "train", ph_opt=5.0)
+        low = ProteinRecord("L", "C" * 10, "train", ph_opt=9.0)
+        training = [high, low]
+        hits = {
+            (_safe_key(query), _safe_key(high)): SequenceHit(0.8, 1.0, 1.0, 50.0),
+            (_safe_key(query), _safe_key(low)): SequenceHit(0.1, 1.0, 1.0, 20.0),
+        }
+        config = {
+            "retrieval": {
+                "low_homology_identity": 0.2,
+                "low_homology_coverage": 0.8,
+                "low_homology_coverage_mode": 0,
+            }
+        }
+
+        normal = _aggregate_retrieval_view(
+            query, training, torch.tensor([5.0, 9.0]),
+            [(0, 0.9), (1, 0.8)], [], hits, 1, config,
+            low_homology=False,
+        )
+        filtered = _aggregate_retrieval_view(
+            query, training, torch.tensor([5.0, 9.0]),
+            [(0, 0.9), (1, 0.8)], [], hits, 1, config,
+            low_homology=True,
+        )
+
+        self.assertAlmostEqual(normal["saprot_value"], 5.0)
+        self.assertAlmostEqual(filtered["saprot_value"], 9.0)
+        self.assertAlmostEqual(filtered["identity"], 0.1)
+
+    def test_homology_training_rebuilds_v1_retrieval_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "retrieval.pt"
+            record = ProteinRecord("P", "ACD", "train", ph_opt=7.0, status="ready")
+            atomic_torch_save(
+                destination,
+                {"schema_version": "1", "rows": {record_key(record): {}}},
+            )
+            config = {
+                "_root": directory,
+                "paths": {"retrieval": str(destination)},
+                "homology_training": {"enabled": True},
+                "retrieval": {"top_k": 1, "candidate_k": 2},
+            }
+            rebuilt = RetrievalStore({"schema_version": "2", "rows": {}})
+            with mock.patch.object(
+                RetrievalStore, "build", return_value=rebuilt
+            ) as build:
+                result = ensure_retrieval_store([record], config)
+
+        self.assertIs(result, rebuilt)
+        build.assert_called_once()
+
+    def test_homology_retrieval_signature_controls_cache_reuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "retrieval.pt"
+            record = ProteinRecord("P", "ACD", "train", ph_opt=7.0, status="ready")
+            config = {
+                "_root": directory,
+                "paths": {"retrieval": str(destination)},
+                "homology_training": {"enabled": True},
+                "retrieval": {"top_k": 1, "candidate_k": 2},
+            }
+            row = {"low_homology": {}}
+            atomic_torch_save(
+                destination,
+                {
+                    "schema_version": "2",
+                    "build_signature": retrieval_build_signature(config),
+                    "rows": {record_key(record): row},
+                },
+            )
+            with mock.patch.object(RetrievalStore, "build") as build:
+                store = ensure_retrieval_store([record], config)
+                build.assert_not_called()
+            self.assertEqual(store.payload["schema_version"], "2")
+
+            changed = copy.deepcopy(config)
+            changed["retrieval"]["candidate_k"] = 3
+            rebuilt = RetrievalStore({"schema_version": "2", "rows": {}})
+            with mock.patch.object(
+                RetrievalStore, "build", return_value=rebuilt
+            ) as build:
+                result = ensure_retrieval_store([record], changed)
+
+        self.assertIs(result, rebuilt)
+        build.assert_called_once()
+
     def test_model_forward_and_backward(self):
         config = _tiny_config()
         model = PHGeoFuse(config, torch.device("cpu"))
@@ -289,6 +442,136 @@ class PHGeoFuseTests(unittest.TestCase):
             any(parameter.grad is not None for parameter in model.reliability_gate.parameters())
         )
         self.assertTrue(all(parameter.grad is None for parameter in model.gate.parameters()))
+
+    def test_homology_gate_dual_view_encodes_once(self):
+        config = _tiny_config()
+        config["fusion"] = {
+            "mode": "homology_reliability",
+            "gate_hidden_dim": 16,
+            "gate_dropout": 0.0,
+            "gate_temperature": 1.0,
+        }
+        model = PHGeoFuse(config, torch.device("cpu"))
+        batch = _tiny_batch()
+        low = batch["retrieval"].clone()
+        low[:, 4] = 0.1
+
+        with mock.patch.object(
+            model.geometry, "forward", wraps=model.geometry.forward
+        ) as encode:
+            outputs = model(
+                batch,
+                retrieval_views={"normal": batch["retrieval"], "low_homology": low},
+            )
+
+        self.assertEqual(encode.call_count, 1)
+        self.assertEqual(set(outputs), {"normal", "low_homology"})
+        self.assertEqual(model.homology_gate[0].in_features, 21)
+        torch.testing.assert_close(
+            outputs["normal"]["gate_weights"].sum(dim=-1), torch.ones(2)
+        )
+
+    def test_dual_view_loss_uses_configured_weights(self):
+        config = _tiny_config()
+        config["fusion"] = {"mode": "homology_reliability", "gate_dropout": 0.0}
+        config["homology_training"] = {
+            "normal_loss_weight": 1.0,
+            "low_homology_loss_weight": 0.5,
+            "consistency_weight": 0.1,
+        }
+        config["loss"].update(
+            {
+                "distribution_weight": 0.0,
+                "ec_weight": 0.0,
+                "gate_supervision_weight": 0.0,
+                "gate_prior_weight": 0.0,
+            }
+        )
+        model = PHGeoFuse(config, torch.device("cpu"))
+        batch = _tiny_batch()
+        outputs = model(
+            batch,
+            retrieval_views={
+                "normal": batch["retrieval"],
+                "low_homology": batch["retrieval"],
+            },
+        )
+
+        total, parts = compute_dual_view_loss(outputs, batch, config)
+        normal_mse = parts["normal_mse"]
+        low_mse = parts["low_homology_mse"]
+        expected = normal_mse + 0.5 * low_mse + 0.1 * parts["consistency"]
+
+        torch.testing.assert_close(total.detach(), expected)
+
+    def test_gate_only_scope_freezes_all_other_parameters(self):
+        config = _tiny_config()
+        config["fusion"] = {"mode": "homology_reliability", "gate_dropout": 0.0}
+        config["training"] = {"trainable_scope": "homology_gate"}
+        model = PHGeoFuse(config, torch.device("cpu"))
+
+        _configure_trainable_scope(model, config, init_checkpoint="checkpoint.pt")
+        _set_training_mode(model, config)
+
+        trainable = {
+            name for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+        self.assertTrue(trainable)
+        self.assertTrue(all(name.startswith("homology_gate.") for name in trainable))
+        self.assertFalse(model.training)
+        self.assertTrue(model.homology_gate.training)
+        batch = _tiny_batch()
+        outputs = model(
+            batch,
+            retrieval_views={
+                "normal": batch["retrieval"],
+                "low_homology": batch["retrieval"],
+            },
+        )
+        loss, _ = compute_dual_view_loss(outputs, batch, config)
+        loss.backward()
+        self.assertTrue(
+            all(
+                parameter.grad is not None
+                for parameter in model.homology_gate.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for name, parameter in model.named_parameters()
+                if not name.startswith("homology_gate.")
+            )
+        )
+
+    def test_initial_checkpoint_allows_only_new_homology_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_config = _tiny_config()
+            source_model = PHGeoFuse(source_config, torch.device("cpu"))
+            checkpoint = Path(directory) / "source.pt"
+            atomic_torch_save(
+                checkpoint,
+                {
+                    "model_state_dict": source_model.state_dict(),
+                    "saprot_adapter_only": False,
+                },
+            )
+            target_config = _tiny_config()
+            target_config["fusion"] = {"mode": "homology_reliability"}
+            target_model = PHGeoFuse(target_config, torch.device("cpu"))
+
+            load_initial_checkpoint(checkpoint, target_model)
+
+            invalid = source_model.state_dict()
+            invalid.pop("geometry.project.0.weight")
+            invalid_checkpoint = Path(directory) / "invalid.pt"
+            atomic_torch_save(
+                invalid_checkpoint,
+                {"model_state_dict": invalid, "saprot_adapter_only": False},
+            )
+            with self.assertRaisesRegex(RuntimeError, "invalid initialization"):
+                load_initial_checkpoint(invalid_checkpoint, target_model)
 
     def test_supervised_gate_loss_pushes_probability_to_best_expert(self):
         config = _tiny_config()
@@ -389,6 +672,84 @@ class PHGeoFuseTests(unittest.TestCase):
                 set(row["validation_loss_components"]), {"mse", "distribution", "ec"}
             )
 
+    def test_tiny_homology_gate_training_from_initial_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_config = _tiny_config()
+            source_model = PHGeoFuse(source_config, torch.device("cpu"))
+            initial = root / "initial.pt"
+            atomic_torch_save(
+                initial,
+                {
+                    "model_state_dict": source_model.state_dict(),
+                    "saprot_adapter_only": False,
+                },
+            )
+            config = _tiny_config()
+            config.update(
+                {
+                    "_root": str(root),
+                    "paths": {
+                        "retrieval": str(root / "retrieval.pt"),
+                        "runs": str(root / "runs"),
+                    },
+                    "fusion": {
+                        "mode": "homology_reliability",
+                        "gate_hidden_dim": 8,
+                        "gate_dropout": 0.0,
+                        "gate_temperature": 1.0,
+                        "gate_prior": [0.25, 0.25, 0.5],
+                    },
+                    "homology_training": {
+                        "enabled": True,
+                        "normal_loss_weight": 1.0,
+                        "low_homology_loss_weight": 0.5,
+                        "consistency_weight": 0.1,
+                    },
+                    "training": {
+                        "seed": 11,
+                        "run_name": "homology-smoke",
+                        "trainable_scope": "homology_gate",
+                        "per_device_batch_size": 2,
+                        "global_batch_size": 2,
+                        "num_workers": 0,
+                        "epochs": 1,
+                        "learning_rate": 1e-3,
+                        "weight_decay": 0.0,
+                        "warmup_fraction": 0.0,
+                        "early_stopping_patience": 2,
+                    },
+                }
+            )
+            config["loss"].update(
+                {"gate_supervision_weight": 0.1, "gate_prior_weight": 0.01}
+            )
+            config["retrieval"].update(
+                {
+                    "top_k": 1,
+                    "candidate_k": 2,
+                    "require_foldseek": False,
+                    "mmseqs_binary": "missing",
+                }
+            )
+            config["structure"] = {"foldseek_binary": "missing"}
+            records = _tiny_records(root)
+            context = DistributedContext(False, 0, 0, 1, torch.device("cpu"))
+
+            checkpoint = train_model(
+                records, config, context, init_checkpoint=initial
+            )
+
+            self.assertTrue(checkpoint.is_file())
+            metrics = json.loads(
+                (root / "runs" / "homology-smoke_frozen_seed11" / "metrics.jsonl")
+                .read_text()
+                .splitlines()[0]
+            )
+            self.assertIn("normal_mse", metrics["train_loss_components"])
+            self.assertIn("low_homology_mse", metrics["train_loss_components"])
+            self.assertIn("consistency", metrics["train_loss_components"])
+
     def test_train_diagnostics_do_not_change_parameter_updates(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -475,7 +836,12 @@ def _tiny_batch():
         "graph_index": torch.tensor([0, 0, 0, 1, 1]),
         "embeddings": torch.randn(5, 4), "labels": torch.tensor([6.5, 7.5]),
         "weights": torch.ones(2), "ec_labels": torch.tensor([0, 1]),
-        "retrieval": torch.tensor([[6.0, 7.0, .8, .7, .5, .2, .3, 1., 1.], [7.0, 8.0, .8, .7, .5, .2, .3, 1., 1.]]),
+        "retrieval": torch.tensor(
+            [
+                [6.0, 7.0, .8, .7, .5, .2, .3, 1., 1., .9, .9, 1., 1., .1, .1],
+                [7.0, 8.0, .8, .7, .5, .2, .3, 1., 1., .9, .9, 1., 1., .1, .1],
+            ]
+        ),
     }
 
 

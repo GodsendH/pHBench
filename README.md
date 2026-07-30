@@ -290,6 +290,59 @@ torchrun --standalone --nproc_per_node=4 \
   --checkpoint artifacts/phgeofuse/datasets/identity20/runs/phgeofuse_phopt_mse_frozen_seed42/best.pt
 ```
 
+### Homology-aware dual-view gate training
+
+The homology-aware configuration builds retrieval cache schema v2. Each query
+stores the normal top-k neighbors and a second view that removes MMseqs2 hits
+with at least 20% identity and 80% query-and-target coverage. The first nine
+retrieval features remain compatible with existing models; coverage, hit-rate,
+and similarity-margin diagnostics are appended for the new gate. An existing
+v1 cache is rebuilt automatically the first time this configuration is used.
+
+Initialize the new gate from the matching tuned-v1 checkpoint. The default
+configuration freezes SaProt, EGNN, and the pH decoder and trains only the new
+gate with normal and low-homology retrieval views:
+
+```bash
+conda activate phbench
+
+# Original PHOPT split.
+python -m phgeofuse.train \
+  --config configs/phgeofuse_phopt_homology_gate_v1.yaml \
+  --dataset phopt \
+  --init-checkpoint \
+    artifacts/phgeofuse/runs/phgeofuse_phopt_tuned_mse_v1_frozen_seed42/best.pt
+
+# Strict identity20 split.
+python -m phgeofuse.train \
+  --config configs/phgeofuse_phopt_homology_gate_v1.yaml \
+  --dataset identity20 \
+  --init-checkpoint \
+    artifacts/phgeofuse/datasets/identity20/runs/phgeofuse_phopt_tuned_mse_v1_frozen_seed42/best.pt
+```
+
+Do not combine the PHOPT and identity20 training splits. The controlled
+datasets were rebuilt from the merged PHOPT records, so the two split systems
+overlap across train and test. Train separate checkpoints with the same recipe
+and select each checkpoint only with its own validation set.
+
+Evaluate the resulting checkpoints with their matching dataset:
+
+```bash
+python -m phgeofuse.evaluate \
+  --config configs/phgeofuse_phopt_homology_gate_v1.yaml \
+  --dataset identity20 \
+  --checkpoint \
+    artifacts/phgeofuse/datasets/identity20/runs/phgeofuse_phopt_homology_gate_v1_frozen_seed42/best.pt \
+  --split test
+```
+
+Prediction CSV and metrics JSON outputs include sequence identity, query and
+target coverage, retrieval hit fractions, similarity margins, and metrics for
+the low-homology subset. Set `training.trainable_scope: all` only for a later
+full-model experiment; the default gate-only mode requires `--init-checkpoint`
+or `--resume`.
+
 For homology-controlled datasets, PhGeoFuse stores manifests, retrieval caches,
 predictions, and runs below `artifacts/phgeofuse/datasets/<dataset>/`; structure,
 graph, and SaProt embedding caches remain shared by sequence hash. Use the same
@@ -348,7 +401,8 @@ python -m phgeofuse.predict --fasta proteins.fasta \
 Run lightweight tests and the two-process CPU distributed smoke test with:
 
 ```bash
-python -m unittest tests.test_phgeofuse
+python -m unittest discover -s tests -v
+python tests/phgeofuse_homology_gpu_smoke.py
 torchrun --standalone --nproc_per_node=2 tests/phgeofuse_ddp_smoke.py
 torchrun --standalone --nproc_per_node=2 tests/phgeofuse_training_ddp_smoke.py
 ```

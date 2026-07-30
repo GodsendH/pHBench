@@ -112,8 +112,13 @@ class PHGeoFuse(nn.Module):
         edge_dim = int(get(config, "graph.rbf_bins", 16)) + 2
         self.retrieval_dropout = float(get(config, "retrieval.dropout", 0.4))
         self.fusion_mode = str(get(config, "fusion.mode", "learned")).lower()
-        if self.fusion_mode not in {"learned", "fixed", "reliability"}:
-            raise ValueError("fusion.mode must be 'learned', 'fixed', or 'reliability'")
+        if self.fusion_mode not in {
+            "learned", "fixed", "reliability", "homology_reliability"
+        }:
+            raise ValueError(
+                "fusion.mode must be 'learned', 'fixed', 'reliability', "
+                "or 'homology_reliability'"
+            )
         fixed_weights = torch.tensor(
             get(config, "fusion.fixed_weights", [0.25, 0.25, 0.5]),
             dtype=torch.float32,
@@ -144,6 +149,7 @@ class PHGeoFuse(nn.Module):
         self.ec_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 7))
         self.gate = nn.Sequential(nn.Linear(6, 64), nn.SiLU(), nn.Dropout(0.1), nn.Linear(64, 3))
         self.reliability_gate = None
+        self.homology_gate = None
         self.gate_temperature = float(get(config, "fusion.gate_temperature", 1.0))
         if self.gate_temperature <= 0:
             raise ValueError("fusion.gate_temperature must be positive")
@@ -154,6 +160,17 @@ class PHGeoFuse(nn.Module):
                 raise ValueError("reliability gate hidden dimension and dropout are invalid")
             self.reliability_gate = nn.Sequential(
                 nn.Linear(15, gate_hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(gate_dropout),
+                nn.Linear(gate_hidden_dim, 3),
+            )
+        elif self.fusion_mode == "homology_reliability":
+            gate_hidden_dim = int(get(config, "fusion.gate_hidden_dim", 64))
+            gate_dropout = float(get(config, "fusion.gate_dropout", 0.1))
+            if gate_hidden_dim <= 0 or not 0 <= gate_dropout < 1:
+                raise ValueError("homology gate hidden dimension and dropout are invalid")
+            self.homology_gate = nn.Sequential(
+                nn.Linear(21, gate_hidden_dim),
                 nn.SiLU(),
                 nn.Dropout(gate_dropout),
                 nn.Linear(gate_hidden_dim, 3),
@@ -204,7 +221,11 @@ class PHGeoFuse(nn.Module):
             rows.append(row)
         return torch.cat(rows, dim=0)
 
-    def forward(self, batch: dict[str, Any]):
+    def forward(
+        self,
+        batch: dict[str, Any],
+        retrieval_views: dict[str, torch.Tensor] | None = None,
+    ):
         embeddings = batch["embeddings"]
         if self.mode == "lora":
             embeddings = self._lora_embeddings(batch["saprot_texts"], batch["lengths"])
@@ -222,7 +243,24 @@ class PHGeoFuse(nn.Module):
         )
         pooled = scatter_mean(hidden, batch["graph_index"], int(batch["lengths"].shape[0]))
         ec_logits = self.ec_head(pooled)
-        retrieval = batch["retrieval"]
+        shared = {
+            "logits": logits,
+            "probabilities": probabilities,
+            "global_mean": global_mean,
+            "global_variance": global_variance,
+            "ec_logits": ec_logits,
+            "coords": updated_coords,
+        }
+        if retrieval_views is not None:
+            return {
+                name: self._fuse(shared, retrieval)
+                for name, retrieval in retrieval_views.items()
+            }
+        return self._fuse(shared, batch["retrieval"])
+
+    def _fuse(self, shared: dict[str, torch.Tensor], retrieval: torch.Tensor):
+        global_mean = shared["global_mean"]
+        global_variance = shared["global_variance"]
         reliability_context = torch.stack(
             [retrieval[:, 2], retrieval[:, 3], retrieval[:, 4], retrieval[:, 5], retrieval[:, 6], global_variance], dim=-1
         )
@@ -238,7 +276,7 @@ class PHGeoFuse(nn.Module):
             dropped = torch.rand_like(available[:, 1:].float()) < self.retrieval_dropout
             available[:, 1:] &= ~dropped
         if self.fusion_mode == "fixed":
-            gate_weights = self.fixed_gate_weights.to(hidden).expand(len(available), -1)
+            gate_weights = self.fixed_gate_weights.to(expert_means).expand(len(available), -1)
             gate_weights = gate_weights * available.to(gate_weights.dtype)
             gate_weights = gate_weights / gate_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         elif self.fusion_mode == "reliability":
@@ -264,6 +302,36 @@ class PHGeoFuse(nn.Module):
                 ~available, torch.finfo(gate_logits.dtype).min
             )
             gate_weights = torch.softmax(gate_logits / self.gate_temperature, dim=-1)
+        elif self.fusion_mode == "homology_reliability":
+            extended_context = torch.cat(
+                [
+                    retrieval[:, [2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14]],
+                    global_variance.unsqueeze(-1),
+                ],
+                dim=-1,
+            )
+            disagreements = torch.stack(
+                [
+                    (expert_means[:, 0] - expert_means[:, 1]).abs(),
+                    (expert_means[:, 0] - expert_means[:, 2]).abs(),
+                    (expert_means[:, 1] - expert_means[:, 2]).abs(),
+                ],
+                dim=-1,
+            )
+            gate_features = torch.cat(
+                [
+                    extended_context,
+                    expert_means,
+                    disagreements,
+                    available.to(expert_means.dtype),
+                ],
+                dim=-1,
+            ).detach()
+            gate_logits = self.homology_gate(gate_features)
+            gate_logits = gate_logits.masked_fill(
+                ~available, torch.finfo(gate_logits.dtype).min
+            )
+            gate_weights = torch.softmax(gate_logits / self.gate_temperature, dim=-1)
         else:
             gate_logits = self.gate(reliability_context)
             gate_logits = gate_logits.masked_fill(~available, torch.finfo(gate_logits.dtype).min)
@@ -272,16 +340,12 @@ class PHGeoFuse(nn.Module):
         expert_variances = torch.stack([global_variance, retrieval[:, 5], retrieval[:, 6]], dim=-1)
         variance = (gate_weights * (expert_variances + (expert_means - mean.unsqueeze(-1)).square())).sum(dim=-1)
         return {
-            "logits": logits,
-            "probabilities": probabilities,
-            "global_mean": global_mean,
+            **shared,
             "mean": mean,
             "variance": variance,
-            "ec_logits": ec_logits,
             "gate_weights": gate_weights,
             "expert_means": expert_means,
             "expert_available": available,
-            "coords": updated_coords,
         }
 
 
@@ -316,47 +380,95 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, Any], config
         "distribution": weighted_distribution.detach(),
         "ec": ec_loss.detach(),
     }
+    gate_loss, gate_components = _gate_regularization(outputs, labels, config)
+    total = total + gate_loss
+    components.update(gate_components)
+    return total, components
+
+
+def compute_low_homology_loss(
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, Any],
+    config: dict[str, Any],
+):
+    labels = batch["labels"]
+    mse = F.mse_loss(outputs["mean"], labels)
+    gate_loss, gate_components = _gate_regularization(outputs, labels, config)
+    total = float(get(config, "loss.mse_weight", 1.0)) * mse + gate_loss
+    return total, {"mse": mse.detach(), **gate_components}
+
+
+def compute_dual_view_loss(
+    outputs: dict[str, dict[str, torch.Tensor]],
+    batch: dict[str, Any],
+    config: dict[str, Any],
+):
+    if set(outputs) != {"normal", "low_homology"}:
+        raise ValueError("dual-view outputs must contain normal and low_homology")
+    normal_loss, normal_components = compute_loss(outputs["normal"], batch, config)
+    low_loss, low_components = compute_low_homology_loss(
+        outputs["low_homology"], batch, config
+    )
+    consistency = F.smooth_l1_loss(
+        outputs["low_homology"]["mean"],
+        outputs["normal"]["mean"].detach(),
+    )
+    normal_weight = float(get(config, "homology_training.normal_loss_weight", 1.0))
+    low_weight = float(get(config, "homology_training.low_homology_loss_weight", 0.5))
+    consistency_weight = float(get(config, "homology_training.consistency_weight", 0.1))
+    total = (
+        normal_weight * normal_loss
+        + low_weight * low_loss
+        + consistency_weight * consistency
+    )
+    components = {
+        **{f"normal_{name}": value for name, value in normal_components.items()},
+        **{f"low_homology_{name}": value for name, value in low_components.items()},
+        "consistency": consistency.detach(),
+    }
+    return total, components
+
+
+def _gate_regularization(outputs, labels, config):
     gate_supervision_weight = float(get(config, "loss.gate_supervision_weight", 0.0))
     gate_prior_weight = float(get(config, "loss.gate_prior_weight", 0.0))
-    if gate_supervision_weight > 0 or gate_prior_weight > 0:
-        if "expert_means" not in outputs or "expert_available" not in outputs:
-            raise ValueError("supervised gate loss requires expert predictions and availability")
-        gate_weights = outputs["gate_weights"].clamp_min(1e-8)
-        available = outputs["expert_available"].bool()
-        target_temperature = float(get(config, "loss.gate_target_temperature", 0.3))
-        if target_temperature <= 0:
-            raise ValueError("loss.gate_target_temperature must be positive")
-        expert_errors = (
-            outputs["expert_means"].detach() - labels.unsqueeze(-1)
-        ).abs()
-        target_logits = -expert_errors / target_temperature
-        target_logits = target_logits.masked_fill(
-            ~available, torch.finfo(target_logits.dtype).min
-        )
-        gate_targets = torch.softmax(target_logits, dim=-1)
-        gate_supervision = -(gate_targets * gate_weights.log()).sum(dim=-1).mean()
+    zero = labels.new_zeros(())
+    if gate_supervision_weight <= 0 and gate_prior_weight <= 0:
+        return zero, {}
+    if "expert_means" not in outputs or "expert_available" not in outputs:
+        raise ValueError("supervised gate loss requires expert predictions and availability")
+    gate_weights = outputs["gate_weights"].clamp_min(1e-8)
+    available = outputs["expert_available"].bool()
+    target_temperature = float(get(config, "loss.gate_target_temperature", 0.3))
+    if target_temperature <= 0:
+        raise ValueError("loss.gate_target_temperature must be positive")
+    expert_errors = (outputs["expert_means"].detach() - labels.unsqueeze(-1)).abs()
+    target_logits = (-expert_errors / target_temperature).masked_fill(
+        ~available, torch.finfo(expert_errors.dtype).min
+    )
+    gate_targets = torch.softmax(target_logits, dim=-1)
+    gate_supervision = -(gate_targets * gate_weights.log()).sum(dim=-1).mean()
 
-        gate_prior = torch.as_tensor(
-            get(config, "fusion.gate_prior", [0.25, 0.25, 0.5]),
-            dtype=gate_weights.dtype,
-            device=gate_weights.device,
-        )
-        if gate_prior.shape != (3,) or bool((gate_prior < 0).any()) or float(gate_prior.sum()) <= 0:
-            raise ValueError("fusion.gate_prior must contain three non-negative values")
-        gate_prior = gate_prior.expand_as(gate_weights) * available.to(gate_weights.dtype)
-        gate_prior = gate_prior / gate_prior.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        gate_prior = gate_prior.clamp_min(1e-8)
-        gate_prior_loss = (
-            gate_weights * (gate_weights.log() - gate_prior.log())
-        ).sum(dim=-1).mean()
-        total = (
-            total
-            + gate_supervision_weight * gate_supervision
-            + gate_prior_weight * gate_prior_loss
-        )
-        components["gate_supervision"] = gate_supervision.detach()
-        components["gate_prior"] = gate_prior_loss.detach()
-    return total, components
+    gate_prior = torch.as_tensor(
+        get(config, "fusion.gate_prior", [0.25, 0.25, 0.5]),
+        dtype=gate_weights.dtype,
+        device=gate_weights.device,
+    )
+    if gate_prior.shape != (3,) or bool((gate_prior < 0).any()) or float(gate_prior.sum()) <= 0:
+        raise ValueError("fusion.gate_prior must contain three non-negative values")
+    gate_prior = gate_prior.expand_as(gate_weights) * available.to(gate_weights.dtype)
+    gate_prior = gate_prior / gate_prior.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    gate_prior_loss = (
+        gate_weights * (gate_weights.log() - gate_prior.clamp_min(1e-8).log())
+    ).sum(dim=-1).mean()
+    total = (
+        gate_supervision_weight * gate_supervision
+        + gate_prior_weight * gate_prior_loss
+    )
+    return total, {
+        "gate_supervision": gate_supervision.detach(),
+        "gate_prior": gate_prior_loss.detach(),
+    }
 
 
 def _pad_hidden(hidden, graph_index, lengths):

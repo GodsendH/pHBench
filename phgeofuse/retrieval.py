@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -14,6 +15,35 @@ import torch
 from .cache import atomic_torch_save
 from .config import get, path
 from .io import ProteinRecord
+
+
+RETRIEVAL_SCHEMA_VERSION = "2"
+RETRIEVAL_FEATURE_NAMES = (
+    "saprot_value",
+    "foldseek_value",
+    "saprot_similarity",
+    "foldseek_similarity",
+    "identity",
+    "saprot_variance",
+    "foldseek_variance",
+    "saprot_available",
+    "foldseek_available",
+    "query_coverage",
+    "target_coverage",
+    "saprot_hit_fraction",
+    "foldseek_hit_fraction",
+    "saprot_similarity_margin",
+    "foldseek_similarity_margin",
+)
+RETRIEVAL_FEATURE_DIM = len(RETRIEVAL_FEATURE_NAMES)
+
+
+@dataclass(frozen=True)
+class SequenceHit:
+    identity: float
+    query_coverage: float
+    target_coverage: float
+    bits: float
 
 
 def record_key(record: ProteinRecord) -> str:
@@ -41,6 +71,75 @@ def _weighted_label(labels: torch.Tensor, scores: torch.Tensor, temperature: flo
     return value, float(scores.max()), variance
 
 
+def _default_feature_row() -> dict[str, float | bool]:
+    return {
+        "saprot_value": 0.0,
+        "foldseek_value": 0.0,
+        "saprot_similarity": 0.0,
+        "foldseek_similarity": 0.0,
+        "identity": 0.0,
+        "saprot_variance": 1.0,
+        "foldseek_variance": 1.0,
+        "saprot_available": False,
+        "foldseek_available": False,
+        "query_coverage": 0.0,
+        "target_coverage": 0.0,
+        "saprot_hit_fraction": 0.0,
+        "foldseek_hit_fraction": 0.0,
+        "saprot_similarity_margin": 0.0,
+        "foldseek_similarity_margin": 0.0,
+    }
+
+
+def _feature_tensor(row: dict[str, Any] | None) -> torch.Tensor:
+    values = _default_feature_row()
+    if row:
+        values.update({name: row.get(name, values[name]) for name in values})
+    return torch.tensor(
+        [float(values[name]) for name in RETRIEVAL_FEATURE_NAMES],
+        dtype=torch.float32,
+    )
+
+
+def _fraction(value: Any, default: float) -> float:
+    result = float(default if value is None else value)
+    if result > 1.0:
+        result /= 100.0
+    if not 0.0 <= result <= 1.0:
+        raise ValueError("homology identity and coverage must be between 0 and 1")
+    return result
+
+
+def _candidate_k(config: dict[str, Any], training_count: int) -> int:
+    top_k = int(get(config, "retrieval.top_k", 5))
+    default = 64 if homology_training_enabled(config) else max(20, top_k * 4)
+    configured = int(get(config, "retrieval.candidate_k", default))
+    return min(training_count, max(top_k + 1, configured))
+
+
+def retrieval_build_signature(config: dict[str, Any]) -> dict[str, Any]:
+    top_k = int(get(config, "retrieval.top_k", 5))
+    default_candidate_k = 64 if homology_training_enabled(config) else max(20, top_k * 4)
+    return {
+        "top_k": top_k,
+        "candidate_k": int(get(config, "retrieval.candidate_k", default_candidate_k)),
+        "low_homology_identity": _fraction(
+            get(config, "retrieval.low_homology_identity", 0.2), 0.2
+        ),
+        "low_homology_coverage": _fraction(
+            get(config, "retrieval.low_homology_coverage", 0.8), 0.8
+        ),
+        "low_homology_coverage_mode": int(
+            get(config, "retrieval.low_homology_coverage_mode", 0)
+        ),
+        "search_sensitivity": float(get(config, "retrieval.search_sensitivity", 7.5)),
+    }
+
+
+def homology_training_enabled(config: dict[str, Any]) -> bool:
+    return bool(get(config, "homology_training.enabled", False))
+
+
 class RetrievalStore:
     def __init__(self, payload: dict[str, Any]):
         self.payload = payload
@@ -50,20 +149,15 @@ class RetrievalStore:
     def load(cls, source: str | Path) -> "RetrievalStore":
         return cls(torch.load(source, map_location="cpu"))
 
-    def features(self, key: str) -> torch.Tensor:
+    def features(self, key: str, view: str = "normal") -> torch.Tensor:
+        if view not in {"normal", "low_homology"}:
+            raise ValueError(f"unknown retrieval view: {view}")
         row = self.rows.get(key)
         if row is None:
-            return torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0])
-        return torch.tensor(
-            [
-                row.get("saprot_value", 0.0), row.get("foldseek_value", 0.0),
-                row.get("saprot_similarity", 0.0), row.get("foldseek_similarity", 0.0),
-                row.get("identity", 0.0), row.get("saprot_variance", 1.0),
-                row.get("foldseek_variance", 1.0),
-                float(row.get("saprot_available", False)), float(row.get("foldseek_available", False)),
-            ],
-            dtype=torch.float32,
-        )
+            return _feature_tensor(None)
+        if view == "low_homology":
+            row = row.get("low_homology", row)
+        return _feature_tensor(row)
 
     def add_queries(self, records: Iterable[ProteinRecord], config: dict[str, Any]) -> None:
         records = list(records)
@@ -75,43 +169,9 @@ class RetrievalStore:
             raise ValueError("retrieval cache does not contain training provenance")
         train_vectors = self.payload["training_vectors"].float()
         labels = self.payload["training_labels"].float()
-        queries = torch.stack([_load_mean_embedding(record) for record in records])
-        top_k = int(self.payload.get("top_k", 5))
-        neighbors = _cosine_neighbors(queries, train_vectors, min(len(training), top_k))
-        foldseek_hits = _foldseek_hits(records, training, config)
-        identities = _mmseqs_hits(records, training, config)
-        training_by_safe = {_safe_key(record): record for record in training}
-        for query_index, record in enumerate(records):
-            indices, scores = neighbors[query_index]
-            saprot_value, saprot_similarity, saprot_variance = _weighted_label(
-                labels[indices], scores
-            )
-            identity = max(
-                identities.get((_safe_key(record), _safe_key(training[index])),
-                               _positional_identity(record.sequence, training[index].sequence))
-                for index in indices.tolist()
-            )
-            structural = [
-                (training_by_safe[target], score)
-                for target, score in foldseek_hits.get(_safe_key(record), [])[:top_k]
-                if target in training_by_safe
-            ]
-            if structural:
-                fold_value, fold_similarity, fold_variance = _weighted_label(
-                    torch.tensor([target.ph_opt for target, _ in structural]),
-                    torch.tensor([score for _, score in structural]),
-                    temperature=0.2,
-                )
-            else:
-                fold_value, fold_similarity, fold_variance = math.nan, 0.0, math.nan
-            self.rows[record_key(record)] = {
-                "saprot_value": saprot_value, "saprot_similarity": saprot_similarity,
-                "saprot_variance": saprot_variance, "saprot_available": True,
-                "foldseek_value": _finite_or_zero(fold_value),
-                "foldseek_similarity": fold_similarity,
-                "foldseek_variance": _finite_or_one(fold_variance),
-                "foldseek_available": bool(structural), "identity": identity,
-            }
+        self.rows.update(
+            _build_retrieval_rows(records, training, train_vectors, labels, config)
+        )
 
     @classmethod
     def build(
@@ -125,69 +185,12 @@ class RetrievalStore:
         if not training:
             raise ValueError("retrieval requires at least one labeled training protein")
         train_vectors = torch.stack([_load_mean_embedding(record) for record in training])
-        query_vectors = torch.stack([_load_mean_embedding(record) for record in records])
-        top_k = int(get(config, "retrieval.top_k", 5))
-        candidate_k = min(len(training), max(top_k + 1, top_k * 2))
-        saprot_neighbors = _cosine_neighbors(query_vectors, train_vectors, candidate_k)
-        identities = _mmseqs_hits(records, training, config)
-        foldseek_hits = _foldseek_hits(records, training, config)
-        train_by_safe = {_safe_key(record): record for record in training}
-        rows: dict[str, dict[str, Any]] = {}
         labels = torch.tensor([record.ph_opt for record in training], dtype=torch.float32)
-        for query_index, record in enumerate(records):
-            neighbor_indices, scores = saprot_neighbors[query_index]
-            kept_indices, kept_scores = [], []
-            for index, score in zip(neighbor_indices.tolist(), scores.tolist(), strict=True):
-                target = training[index]
-                if record_key(target) == record_key(record):
-                    continue
-                kept_indices.append(index)
-                kept_scores.append(score)
-                if len(kept_indices) == top_k:
-                    break
-            if kept_indices:
-                selected_labels = labels[torch.tensor(kept_indices)]
-                selected_scores = torch.tensor(kept_scores)
-                saprot_value, saprot_similarity, saprot_variance = _weighted_label(
-                    selected_labels, selected_scores
-                )
-                identity = max(
-                    identities.get((_safe_key(record), _safe_key(training[index])),
-                                   _positional_identity(record.sequence, training[index].sequence))
-                    for index in kept_indices
-                )
-            else:
-                saprot_value, saprot_similarity, saprot_variance, identity = math.nan, 0.0, math.nan, 0.0
-
-            structural = []
-            for target_key, score in foldseek_hits.get(_safe_key(record), []):
-                target = train_by_safe.get(target_key)
-                if target is None or record_key(target) == record_key(record):
-                    continue
-                structural.append((target, score))
-                if len(structural) == top_k:
-                    break
-            if structural:
-                fold_labels = torch.tensor([target.ph_opt for target, _ in structural])
-                fold_scores = torch.tensor([score for _, score in structural])
-                fold_value, fold_similarity, fold_variance = _weighted_label(
-                    fold_labels, fold_scores, temperature=0.2
-                )
-            else:
-                fold_value, fold_similarity, fold_variance = math.nan, 0.0, math.nan
-            rows[record_key(record)] = {
-                "saprot_value": _finite_or_zero(saprot_value),
-                "saprot_similarity": saprot_similarity,
-                "saprot_variance": _finite_or_one(saprot_variance),
-                "saprot_available": bool(kept_indices),
-                "foldseek_value": _finite_or_zero(fold_value),
-                "foldseek_similarity": fold_similarity,
-                "foldseek_variance": _finite_or_one(fold_variance),
-                "foldseek_available": bool(structural),
-                "identity": identity,
-            }
+        rows = _build_retrieval_rows(records, training, train_vectors, labels, config)
+        top_k = int(get(config, "retrieval.top_k", 5))
         payload = {
-            "schema_version": "1",
+            "schema_version": RETRIEVAL_SCHEMA_VERSION,
+            "build_signature": retrieval_build_signature(config),
             "rows": rows,
             "training_keys": [record_key(record) for record in training],
             "training_vectors": train_vectors.half(),
@@ -213,6 +216,202 @@ class RetrievalStore:
         }
         atomic_torch_save(destination, payload)
         return cls(payload)
+
+
+def _build_retrieval_rows(
+    records: list[ProteinRecord],
+    training: list[ProteinRecord],
+    train_vectors: torch.Tensor,
+    labels: torch.Tensor,
+    config: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    if not records:
+        return {}
+    top_k = int(get(config, "retrieval.top_k", 5))
+    if top_k < 1:
+        raise ValueError("retrieval.top_k must be positive")
+    candidate_k = _candidate_k(config, len(training))
+    query_vectors = torch.stack([_load_mean_embedding(record) for record in records])
+    saprot_neighbors = _cosine_neighbors(query_vectors, train_vectors, candidate_k)
+    sequence_hits = _mmseqs_hits(records, training, config)
+    foldseek_hits = _foldseek_hits(records, training, config)
+    training_by_safe = {_safe_key(record): (index, record) for index, record in enumerate(training)}
+    rows: dict[str, dict[str, Any]] = {}
+    for query_index, record in enumerate(records):
+        indices, scores = saprot_neighbors[query_index]
+        saprot_candidates = [
+            (int(index), float(score))
+            for index, score in zip(indices.tolist(), scores.tolist(), strict=True)
+            if record_key(training[int(index)]) != record_key(record)
+        ]
+        structural_candidates = [
+            (target_index, target, float(score))
+            for target_key, score in foldseek_hits.get(_safe_key(record), [])
+            for match in [training_by_safe.get(target_key)]
+            if match is not None
+            for target_index, target in [match]
+            if record_key(target) != record_key(record)
+        ]
+        normal = _aggregate_retrieval_view(
+            record,
+            training,
+            labels,
+            saprot_candidates,
+            structural_candidates,
+            sequence_hits,
+            top_k,
+            config,
+            low_homology=False,
+        )
+        low_homology = _aggregate_retrieval_view(
+            record,
+            training,
+            labels,
+            saprot_candidates,
+            structural_candidates,
+            sequence_hits,
+            top_k,
+            config,
+            low_homology=True,
+        )
+        rows[record_key(record)] = {**normal, "low_homology": low_homology}
+    return rows
+
+
+def _aggregate_retrieval_view(
+    query: ProteinRecord,
+    training: list[ProteinRecord],
+    labels: torch.Tensor,
+    saprot_candidates: list[tuple[int, float]],
+    structural_candidates: list[tuple[int, ProteinRecord, float]],
+    sequence_hits: dict[tuple[str, str], SequenceHit],
+    top_k: int,
+    config: dict[str, Any],
+    *,
+    low_homology: bool,
+) -> dict[str, float | bool]:
+    selected_saprot: list[tuple[int, float]] = []
+    for index, score in saprot_candidates:
+        target = training[index]
+        if low_homology and not _is_low_homology_pair(
+            query, target, sequence_hits, config
+        ):
+            continue
+        selected_saprot.append((index, score))
+        if len(selected_saprot) == top_k:
+            break
+
+    selected_structural: list[tuple[int, ProteinRecord, float]] = []
+    for index, target, score in structural_candidates:
+        if low_homology and not _is_low_homology_pair(
+            query, target, sequence_hits, config
+        ):
+            continue
+        selected_structural.append((index, target, score))
+        if len(selected_structural) == top_k:
+            break
+
+    row = _default_feature_row()
+    if selected_saprot:
+        selected_indices = torch.tensor([index for index, _ in selected_saprot])
+        selected_scores = torch.tensor([score for _, score in selected_saprot])
+        value, similarity, variance = _weighted_label(
+            labels[selected_indices], selected_scores
+        )
+        best_hit = max(
+            (
+                _sequence_hit(query, training[index], sequence_hits)
+                for index, _ in selected_saprot
+            ),
+            key=lambda hit: (hit.identity, hit.bits),
+        )
+        row.update(
+            {
+                "saprot_value": _finite_or_zero(value),
+                "saprot_similarity": similarity,
+                "saprot_variance": _finite_or_one(variance),
+                "saprot_available": True,
+                "identity": best_hit.identity,
+                "query_coverage": best_hit.query_coverage,
+                "target_coverage": best_hit.target_coverage,
+                "saprot_hit_fraction": len(selected_saprot) / top_k,
+                "saprot_similarity_margin": _similarity_margin(selected_scores),
+            }
+        )
+    if selected_structural:
+        fold_labels = torch.tensor(
+            [target.ph_opt for _, target, _ in selected_structural]
+        )
+        fold_scores = torch.tensor([score for _, _, score in selected_structural])
+        value, similarity, variance = _weighted_label(
+            fold_labels, fold_scores, temperature=0.2
+        )
+        row.update(
+            {
+                "foldseek_value": _finite_or_zero(value),
+                "foldseek_similarity": similarity,
+                "foldseek_variance": _finite_or_one(variance),
+                "foldseek_available": True,
+                "foldseek_hit_fraction": len(selected_structural) / top_k,
+                "foldseek_similarity_margin": _similarity_margin(fold_scores),
+            }
+        )
+    return row
+
+
+def _sequence_hit(
+    query: ProteinRecord,
+    target: ProteinRecord,
+    hits: dict[tuple[str, str], SequenceHit],
+) -> SequenceHit:
+    return hits.get(
+        (_safe_key(query), _safe_key(target)),
+        SequenceHit(0.0, 0.0, 0.0, 0.0),
+    )
+
+
+def _is_low_homology_pair(
+    query: ProteinRecord,
+    target: ProteinRecord,
+    hits: dict[tuple[str, str], SequenceHit],
+    config: dict[str, Any],
+) -> bool:
+    hit = _sequence_hit(query, target, hits)
+    identity = _fraction(get(config, "retrieval.low_homology_identity", 0.2), 0.2)
+    coverage = _fraction(get(config, "retrieval.low_homology_coverage", 0.8), 0.8)
+    coverage_mode = int(get(config, "retrieval.low_homology_coverage_mode", 0))
+    homologous = hit.identity >= identity and _coverage_passes(
+        hit, coverage, coverage_mode, len(query.sequence), len(target.sequence)
+    )
+    return not homologous
+
+
+def _coverage_passes(
+    hit: SequenceHit,
+    threshold: float,
+    mode: int,
+    query_length: int,
+    target_length: int,
+) -> bool:
+    if mode == 0:
+        return hit.query_coverage >= threshold and hit.target_coverage >= threshold
+    if mode == 1:
+        return hit.target_coverage >= threshold
+    if mode == 2:
+        return hit.query_coverage >= threshold
+    if mode == 3:
+        return target_length >= threshold * query_length
+    if mode == 4:
+        return query_length >= threshold * target_length
+    if mode == 5:
+        return min(query_length, target_length) >= threshold * max(query_length, target_length)
+    raise ValueError("retrieval.low_homology_coverage_mode must be between 0 and 5")
+
+
+def _similarity_margin(scores: torch.Tensor) -> float:
+    if scores.numel() <= 1:
+        return 0.0
+    return float(scores.max() - scores.mean())
 
 
 def _cosine_neighbors(query: torch.Tensor, target: torch.Tensor, top_k: int):
@@ -243,17 +442,24 @@ def _mmseqs_hits(records, training, config):
         query_fasta.write_text("".join(f">{_safe_key(r)}\n{r.sequence}\n" for r in records))
         train_fasta.write_text("".join(f">{_safe_key(r)}\n{r.sequence}\n" for r in training))
         output = root / "hits.tsv"
+        candidate_k = _candidate_k(config, len(training))
         command = [binary, "easy-search", str(query_fasta), str(train_fasta), str(output),
-                   str(root / "tmp"), "--max-seqs", str(max(20, int(get(config, "retrieval.top_k", 5)) * 4)),
-                   "--format-output", "query,target,fident,bits", "-v", "0"]
+                   str(root / "tmp"), "--max-seqs", str(candidate_k),
+                   "-s", str(float(get(config, "retrieval.search_sensitivity", 7.5))),
+                   "--alignment-mode", "3",
+                   "--format-output", "query,target,fident,qcov,tcov,bits", "-v", "0"]
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
             return {}
-        hits = {}
+        hits: dict[tuple[str, str], SequenceHit] = {}
         for line in output.read_text().splitlines():
-            query, target, identity, _ = line.split("\t")[:4]
-            value = float(identity)
-            hits[(query, target)] = value if value <= 1.0 else value / 100.0
+            query, target, identity, qcov, tcov, bits = line.split("\t")[:6]
+            hits[(query, target)] = SequenceHit(
+                _normalize_reported_fraction(identity),
+                _normalize_reported_fraction(qcov),
+                _normalize_reported_fraction(tcov),
+                float(bits),
+            )
         return hits
 
 
@@ -274,8 +480,9 @@ def _foldseek_hits(records, training, config):
         for record in training:
             os.symlink(Path(record.structure_path).resolve(), train_dir / f"{_safe_key(record)}.pdb")
         output = root / "hits.tsv"
+        candidate_k = _candidate_k(config, len(training))
         command = [binary, "easy-search", str(query_dir), str(train_dir), str(output), str(root / "tmp"),
-                   "--max-seqs", str(max(20, int(get(config, "retrieval.top_k", 5)) * 4)),
+                   "--max-seqs", str(candidate_k),
                    "--format-output", "query,target,bits", "-v", "0"]
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
@@ -298,14 +505,22 @@ def ensure_retrieval_store(records, config, force: bool = False):
     if destination.is_file() and not force:
         store = RetrievalStore.load(destination)
         expected = {record_key(record) for record in records if record.status == "ready"}
-        if expected <= set(store.rows):
+        compatible = expected <= set(store.rows)
+        if homology_training_enabled(config):
+            compatible = (
+                compatible
+                and store.payload.get("schema_version") == RETRIEVAL_SCHEMA_VERSION
+                and store.payload.get("build_signature") == retrieval_build_signature(config)
+                and all("low_homology" in store.rows[key] for key in expected)
+            )
+        if compatible:
             return store
     return RetrievalStore.build(records, config, destination)
 
 
-def _positional_identity(left: str, right: str) -> float:
-    length = max(len(left), len(right))
-    return sum(a == b for a, b in zip(left, right)) / length if length else 0.0
+def _normalize_reported_fraction(value: str | float) -> float:
+    result = float(value)
+    return result if result <= 1.0 else result / 100.0
 
 
 def _finite_or_zero(value: float) -> float:

@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .io import ProteinRecord
-from .retrieval import RetrievalStore, record_key
+from .retrieval import RETRIEVAL_FEATURE_DIM, RetrievalStore, record_key
 from .saprot import saprot_text
 
 
@@ -45,7 +45,16 @@ class ProteinGraphDataset(Dataset):
             embedding = payload["embedding"].float()
             if embedding.shape[0] != len(record.sequence):
                 raise ValueError(f"embedding length mismatch for {record_key(record)}")
-        retrieval = self.retrieval.features(record_key(record)) if self.retrieval else torch.zeros(9)
+        retrieval = (
+            self.retrieval.features(record_key(record))
+            if self.retrieval
+            else torch.zeros(RETRIEVAL_FEATURE_DIM)
+        )
+        low_homology_retrieval = (
+            self.retrieval.features(record_key(record), view="low_homology")
+            if self.retrieval
+            else torch.zeros(RETRIEVAL_FEATURE_DIM)
+        )
         return {
             "key": record_key(record),
             "sequence": record.sequence,
@@ -56,6 +65,7 @@ class ProteinGraphDataset(Dataset):
             "weight": record.sample_weight,
             "ec": _ec_class(record.ec),
             "retrieval": retrieval,
+            "low_homology_retrieval": low_homology_retrieval,
         }
 
 
@@ -96,6 +106,9 @@ def collate_graphs(items: list[dict[str, Any]]) -> dict[str, Any]:
         "weights": torch.tensor([item["weight"] for item in items], dtype=torch.float32),
         "ec_labels": torch.tensor([item["ec"] for item in items], dtype=torch.long),
         "retrieval": torch.stack([item["retrieval"] for item in items]),
+        "low_homology_retrieval": torch.stack(
+            [item["low_homology_retrieval"] for item in items]
+        ),
     }
 
 
