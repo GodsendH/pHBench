@@ -471,6 +471,46 @@ class PHGeoFuseTests(unittest.TestCase):
             outputs["normal"]["gate_weights"].sum(dim=-1), torch.ones(2)
         )
 
+    def test_zero_initialized_homology_residual_preserves_learned_gate(self):
+        source_config = _tiny_config()
+        source_model = PHGeoFuse(source_config, torch.device("cpu"))
+        target_config = copy.deepcopy(source_config)
+        target_config["fusion"] = {
+            "mode": "homology_residual",
+            "gate_hidden_dim": 16,
+            "gate_dropout": 0.0,
+            "gate_temperature": 1.5,
+        }
+        target_model = PHGeoFuse(target_config, torch.device("cpu"))
+        incompatible = target_model.load_state_dict(
+            source_model.state_dict(), strict=False
+        )
+        self.assertTrue(incompatible.missing_keys)
+        self.assertTrue(
+            all(name.startswith("homology_gate.") for name in incompatible.missing_keys)
+        )
+        self.assertFalse(incompatible.unexpected_keys)
+        source_model.eval()
+        target_model.eval()
+        batch = _tiny_batch()
+
+        source = source_model(batch)
+        target = target_model(batch)
+
+        torch.testing.assert_close(target["mean"], source["mean"], rtol=0, atol=0)
+        torch.testing.assert_close(
+            target["gate_weights"], source["gate_weights"], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            target["baseline_mean"], source["mean"], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            target["homology_residual_logits"],
+            torch.zeros_like(target["homology_residual_logits"]),
+            rtol=0,
+            atol=0,
+        )
+
     def test_dual_view_loss_uses_configured_weights(self):
         config = _tiny_config()
         config["fusion"] = {"mode": "homology_reliability", "gate_dropout": 0.0}
@@ -504,9 +544,53 @@ class PHGeoFuseTests(unittest.TestCase):
 
         torch.testing.assert_close(total.detach(), expected)
 
+    def test_preservation_loss_uses_inclusive_identity_coverage_boundary(self):
+        config = _tiny_config()
+        config["fusion"] = {
+            "mode": "homology_residual",
+            "gate_dropout": 0.0,
+            "gate_temperature": 1.0,
+        }
+        config["homology_training"] = {
+            "normal_loss_weight": 0.0,
+            "low_homology_loss_weight": 0.0,
+            "consistency_weight": 0.0,
+            "preservation_weight": 0.5,
+            "preservation_scope": "high_homology",
+            "preservation_identity": 20,
+            "preservation_coverage": 80,
+        }
+        config["loss"].update(
+            {
+                "distribution_weight": 0.0,
+                "ec_weight": 0.0,
+                "gate_supervision_weight": 0.0,
+                "gate_prior_weight": 0.0,
+            }
+        )
+        model = PHGeoFuse(config, torch.device("cpu"))
+        batch = _tiny_batch()
+        batch["retrieval"][0, [4, 9, 10]] = torch.tensor([0.20, 0.80, 0.80])
+        batch["retrieval"][1, [4, 9, 10]] = torch.tensor([0.20, 0.80, 0.79])
+        outputs = model(
+            batch,
+            retrieval_views={
+                "normal": batch["retrieval"],
+                "low_homology": batch["retrieval"],
+            },
+        )
+        outputs["normal"]["mean"] = outputs["normal"]["baseline_mean"] + torch.tensor(
+            [1.0, 2.0]
+        )
+
+        total, parts = compute_dual_view_loss(outputs, batch, config)
+
+        torch.testing.assert_close(parts["preservation"], torch.tensor(0.5))
+        torch.testing.assert_close(total.detach(), torch.tensor(0.25))
+
     def test_gate_only_scope_freezes_all_other_parameters(self):
         config = _tiny_config()
-        config["fusion"] = {"mode": "homology_reliability", "gate_dropout": 0.0}
+        config["fusion"] = {"mode": "homology_residual", "gate_dropout": 0.0}
         config["training"] = {"trainable_scope": "homology_gate"}
         model = PHGeoFuse(config, torch.device("cpu"))
 
@@ -558,10 +642,24 @@ class PHGeoFuseTests(unittest.TestCase):
                 },
             )
             target_config = _tiny_config()
-            target_config["fusion"] = {"mode": "homology_reliability"}
+            target_config["fusion"] = {"mode": "homology_residual"}
             target_model = PHGeoFuse(target_config, torch.device("cpu"))
 
             load_initial_checkpoint(checkpoint, target_model)
+
+            v1_config = _tiny_config()
+            v1_config["fusion"] = {"mode": "homology_reliability"}
+            v1_model = PHGeoFuse(v1_config, torch.device("cpu"))
+            v1_checkpoint = Path(directory) / "homology-v1.pt"
+            atomic_torch_save(
+                v1_checkpoint,
+                {
+                    "model_state_dict": v1_model.state_dict(),
+                    "saprot_adapter_only": False,
+                },
+            )
+            with self.assertRaisesRegex(RuntimeError, "baseline checkpoint"):
+                load_initial_checkpoint(v1_checkpoint, target_model)
 
             invalid = source_model.state_dict()
             invalid.pop("geometry.project.0.weight")
@@ -694,7 +792,7 @@ class PHGeoFuseTests(unittest.TestCase):
                         "runs": str(root / "runs"),
                     },
                     "fusion": {
-                        "mode": "homology_reliability",
+                        "mode": "homology_residual",
                         "gate_hidden_dim": 8,
                         "gate_dropout": 0.0,
                         "gate_temperature": 1.0,
@@ -705,6 +803,10 @@ class PHGeoFuseTests(unittest.TestCase):
                         "normal_loss_weight": 1.0,
                         "low_homology_loss_weight": 0.5,
                         "consistency_weight": 0.1,
+                        "preservation_weight": 0.5,
+                        "preservation_scope": "high_homology",
+                        "preservation_identity": 0.2,
+                        "preservation_coverage": 0.8,
                     },
                     "training": {
                         "seed": 11,
@@ -748,6 +850,7 @@ class PHGeoFuseTests(unittest.TestCase):
             )
             self.assertIn("normal_mse", metrics["train_loss_components"])
             self.assertIn("low_homology_mse", metrics["train_loss_components"])
+            self.assertIn("preservation", metrics["train_loss_components"])
             self.assertIn("consistency", metrics["train_loss_components"])
 
     def test_train_diagnostics_do_not_change_parameter_updates(self):

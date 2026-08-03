@@ -1,0 +1,117 @@
+data:
+  manifest: null
+  splits:
+    train: data/phopt_training.fasta
+    validation: data/phopt_validation.fasta
+    test: data/phopt_testing.fasta
+  subsets:
+    test_low_identity:
+      source_split: test
+      fasta: data/phopt_testing_low_identity.fasta
+      expected_count: 999
+
+paths:
+  manifest: artifacts/phgeofuse/manifest.csv
+  structures: artifacts/phgeofuse/structures
+  graphs: artifacts/phgeofuse/graphs
+  embeddings: artifacts/phgeofuse/embeddings
+  retrieval: artifacts/phgeofuse/retrieval.pt
+  runs: artifacts/phgeofuse/runs
+  predictions: artifacts/phgeofuse/predictions
+
+runtime:
+  offline: true
+
+structure:
+  alphafold_api: https://alphafold.ebi.ac.uk/api/prediction/{protein_id}
+  download_timeout: 60
+  download_attempts: 3
+  esmfold_model: facebook/esmfold_v1
+  esmfold_revision: 75a3841ee059df2bf4d56688166c8fb459ddd97a
+  esmfold_chunk_size: 64
+  foldseek_binary: foldseek
+  propka_binary: propka3
+  plddt_mask_threshold: 70.0
+
+graph:
+  spatial_k: 16
+  cutoff: 16.0
+  rbf_bins: 16
+
+model:
+  mode: frozen
+  saprot_model: westlake-repl/SaProt_650M_AF2
+  saprot_revision: d9b9ad00ef61c0990e611b2b43f2231c7de24b38
+  embedding_dim: 1280
+  hidden_dim: 256
+  egnn_layers: 6
+  attention_heads: 4
+  dropout: 0.15
+  ph_min: 2.0
+  ph_max: 12.0
+  ph_step: 0.25
+  gradient_checkpointing: true
+  lora:
+    rank: 8
+    alpha: 16
+    dropout: 0.05
+
+encoding:
+  batch_size: 1
+
+retrieval:
+  top_k: 5
+  candidate_k: 64
+  dropout: 0.1
+  require_foldseek: true
+  mmseqs_binary: mmseqs
+  search_sensitivity: 7.5
+  low_homology_identity: 0.20
+  low_homology_coverage: 0.80
+  low_homology_coverage_mode: 0
+
+fusion:
+  mode: homology_residual
+  gate_hidden_dim: 64
+  gate_dropout: 0.1
+  gate_temperature: 1.5
+  gate_prior: [0.25, 0.25, 0.50]
+
+homology_training:
+  enabled: true
+  normal_loss_weight: 1.0
+  low_homology_loss_weight: 0.25
+  consistency_weight: 0.1
+  preservation_weight: 0.5
+  preservation_scope: high_homology
+  preservation_identity: 0.20
+  preservation_coverage: 0.80
+
+loss:
+  soft_label_sigma: 0.35
+  mse_weight: 1.0
+  distribution_weight: 0.2
+  ec_weight: 0.05
+  gate_supervision_weight: 0.01
+  gate_prior_weight: 0.01
+  gate_target_temperature: 0.3
+  min_sample_weight: 0.5
+  max_sample_weight: 3.0
+
+training:
+  run_name: phgeofuse_phopt_homology_gate_v2
+  trainable_scope: homology_gate
+  seed: 42
+  per_device_batch_size: 2
+  global_batch_size: 32
+  num_workers: 2
+  epochs: 40
+  learning_rate: 0.00002
+  lora_learning_rate: 0.00001
+  weight_decay: 0.03
+  warmup_fraction: 0.03
+  gradient_clip: 1.0
+  early_stopping_patience: 5
+  precision: bf16
+  diagnostics:
+    evaluate_train: true

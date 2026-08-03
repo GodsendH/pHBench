@@ -290,7 +290,7 @@ torchrun --standalone --nproc_per_node=4 \
   --checkpoint artifacts/phgeofuse/datasets/identity20/runs/phgeofuse_phopt_mse_frozen_seed42/best.pt
 ```
 
-### Homology-aware dual-view gate training
+### Baseline-preserving homology-aware dual-view gate training
 
 The homology-aware configuration builds retrieval cache schema v2. Each query
 stores the normal top-k neighbors and a second view that removes MMseqs2 hits
@@ -299,23 +299,30 @@ retrieval features remain compatible with existing models; coverage, hit-rate,
 and similarity-margin diagnostics are appended for the new gate. An existing
 v1 cache is rebuilt automatically the first time this configuration is used.
 
-Initialize the new gate from the matching tuned-v1 checkpoint. The default
-configuration freezes SaProt, EGNN, and the pH decoder and trains only the new
-gate with normal and low-homology retrieval views:
+The recommended v2 configuration keeps the tuned-v1 learned gate as a frozen
+baseline and adds a zero-initialized homology residual to its logits. Therefore
+the model exactly reproduces tuned-v1 fusion before the first optimizer update.
+Training also anchors high-homology normal-view predictions to that frozen
+baseline while allowing controlled corrections on unreliable retrievals. It
+uses `0.25` low-homology loss weight, `0.5` preservation weight, `2e-5` learning
+rate, and five-epoch early stopping. SaProt, EGNN, the decoder, and the baseline
+gate remain frozen.
+
+Initialize v2 directly from the matching tuned-v1 checkpoint:
 
 ```bash
 conda activate phbench
 
 # Original PHOPT split.
 python -m phgeofuse.train \
-  --config configs/phgeofuse_phopt_homology_gate_v1.yaml \
+  --config configs/phgeofuse_phopt_homology_gate_v2.yaml \
   --dataset phopt \
   --init-checkpoint \
     artifacts/phgeofuse/runs/phgeofuse_phopt_tuned_mse_v1_frozen_seed42/best.pt
 
 # Strict identity20 split.
 python -m phgeofuse.train \
-  --config configs/phgeofuse_phopt_homology_gate_v1.yaml \
+  --config configs/phgeofuse_phopt_homology_gate_v2.yaml \
   --dataset identity20 \
   --init-checkpoint \
     artifacts/phgeofuse/datasets/identity20/runs/phgeofuse_phopt_tuned_mse_v1_frozen_seed42/best.pt
@@ -326,14 +333,18 @@ datasets were rebuilt from the merged PHOPT records, so the two split systems
 overlap across train and test. Train separate checkpoints with the same recipe
 and select each checkpoint only with its own validation set.
 
+Do not resume a v1 homology-gate checkpoint into v2: v1 gate logits were
+absolute, whereas v2 gate logits are residual corrections. Start v2 from the
+tuned-v1 checkpoint as shown above. Resume only a v2 `last.pt` with `--resume`.
+
 Evaluate the resulting checkpoints with their matching dataset:
 
 ```bash
 python -m phgeofuse.evaluate \
-  --config configs/phgeofuse_phopt_homology_gate_v1.yaml \
+  --config configs/phgeofuse_phopt_homology_gate_v2.yaml \
   --dataset identity20 \
   --checkpoint \
-    artifacts/phgeofuse/datasets/identity20/runs/phgeofuse_phopt_homology_gate_v1_frozen_seed42/best.pt \
+    artifacts/phgeofuse/datasets/identity20/runs/phgeofuse_phopt_homology_gate_v2_frozen_seed42/best.pt \
   --split test
 ```
 

@@ -41,7 +41,7 @@ def main():
                 },
                 "structure": {"foldseek_binary": "missing"},
                 "fusion": {
-                    "mode": "homology_reliability",
+            "mode": "homology_residual",
                     "gate_hidden_dim": 8,
                     "gate_dropout": 0.0,
                     "gate_temperature": 1.0,
@@ -49,9 +49,13 @@ def main():
                 },
                 "homology_training": {
                     "enabled": True,
-                    "normal_loss_weight": 1.0,
-                    "low_homology_loss_weight": 0.5,
-                    "consistency_weight": 0.1,
+            "normal_loss_weight": 1.0,
+            "low_homology_loss_weight": 0.25,
+            "consistency_weight": 0.1,
+            "preservation_weight": 0.5,
+            "preservation_scope": "high_homology",
+            "preservation_identity": 0.2,
+            "preservation_coverage": 0.8,
                 },
                 "training": {
                     "seed": 17,

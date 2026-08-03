@@ -113,11 +113,12 @@ class PHGeoFuse(nn.Module):
         self.retrieval_dropout = float(get(config, "retrieval.dropout", 0.4))
         self.fusion_mode = str(get(config, "fusion.mode", "learned")).lower()
         if self.fusion_mode not in {
-            "learned", "fixed", "reliability", "homology_reliability"
+            "learned", "fixed", "reliability", "homology_reliability",
+            "homology_residual",
         }:
             raise ValueError(
                 "fusion.mode must be 'learned', 'fixed', 'reliability', "
-                "or 'homology_reliability'"
+                "'homology_reliability', or 'homology_residual'"
             )
         fixed_weights = torch.tensor(
             get(config, "fusion.fixed_weights", [0.25, 0.25, 0.5]),
@@ -164,7 +165,7 @@ class PHGeoFuse(nn.Module):
                 nn.Dropout(gate_dropout),
                 nn.Linear(gate_hidden_dim, 3),
             )
-        elif self.fusion_mode == "homology_reliability":
+        elif self.fusion_mode in {"homology_reliability", "homology_residual"}:
             gate_hidden_dim = int(get(config, "fusion.gate_hidden_dim", 64))
             gate_dropout = float(get(config, "fusion.gate_dropout", 0.1))
             if gate_hidden_dim <= 0 or not 0 <= gate_dropout < 1:
@@ -175,6 +176,9 @@ class PHGeoFuse(nn.Module):
                 nn.Dropout(gate_dropout),
                 nn.Linear(gate_hidden_dim, 3),
             )
+            if self.fusion_mode == "homology_residual":
+                nn.init.zeros_(self.homology_gate[-1].weight)
+                nn.init.zeros_(self.homology_gate[-1].bias)
         if self.fusion_mode != "learned":
             self.gate.requires_grad_(False)
 
@@ -275,6 +279,7 @@ class PHGeoFuse(nn.Module):
         if self.training and self.retrieval_dropout > 0:
             dropped = torch.rand_like(available[:, 1:].float()) < self.retrieval_dropout
             available[:, 1:] &= ~dropped
+        fusion_details = {}
         if self.fusion_mode == "fixed":
             gate_weights = self.fixed_gate_weights.to(expert_means).expand(len(available), -1)
             gate_weights = gate_weights * available.to(gate_weights.dtype)
@@ -302,7 +307,7 @@ class PHGeoFuse(nn.Module):
                 ~available, torch.finfo(gate_logits.dtype).min
             )
             gate_weights = torch.softmax(gate_logits / self.gate_temperature, dim=-1)
-        elif self.fusion_mode == "homology_reliability":
+        elif self.fusion_mode in {"homology_reliability", "homology_residual"}:
             extended_context = torch.cat(
                 [
                     retrieval[:, [2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14]],
@@ -327,11 +332,26 @@ class PHGeoFuse(nn.Module):
                 ],
                 dim=-1,
             ).detach()
-            gate_logits = self.homology_gate(gate_features)
+            residual_logits = self.homology_gate(gate_features)
+            if self.fusion_mode == "homology_residual":
+                baseline_logits = self.gate(reliability_context)
+                baseline_logits = baseline_logits.masked_fill(
+                    ~available, torch.finfo(baseline_logits.dtype).min
+                )
+                baseline_gate_weights = torch.softmax(baseline_logits, dim=-1)
+                baseline_mean = (baseline_gate_weights * expert_means).sum(dim=-1)
+                gate_logits = baseline_logits + residual_logits / self.gate_temperature
+                fusion_details = {
+                    "baseline_mean": baseline_mean,
+                    "baseline_gate_weights": baseline_gate_weights,
+                    "homology_residual_logits": residual_logits,
+                }
+            else:
+                gate_logits = residual_logits / self.gate_temperature
             gate_logits = gate_logits.masked_fill(
                 ~available, torch.finfo(gate_logits.dtype).min
             )
-            gate_weights = torch.softmax(gate_logits / self.gate_temperature, dim=-1)
+            gate_weights = torch.softmax(gate_logits, dim=-1)
         else:
             gate_logits = self.gate(reliability_context)
             gate_logits = gate_logits.masked_fill(~available, torch.finfo(gate_logits.dtype).min)
@@ -346,6 +366,7 @@ class PHGeoFuse(nn.Module):
             "gate_weights": gate_weights,
             "expert_means": expert_means,
             "expert_available": available,
+            **fusion_details,
         }
 
 
@@ -416,17 +437,78 @@ def compute_dual_view_loss(
     normal_weight = float(get(config, "homology_training.normal_loss_weight", 1.0))
     low_weight = float(get(config, "homology_training.low_homology_loss_weight", 0.5))
     consistency_weight = float(get(config, "homology_training.consistency_weight", 0.1))
+    preservation_weight = float(
+        get(config, "homology_training.preservation_weight", 0.0)
+    )
+    preservation = batch["labels"].new_zeros(())
+    if preservation_weight > 0:
+        normal = outputs["normal"]
+        if "baseline_mean" not in normal:
+            raise ValueError(
+                "homology preservation requires fusion.mode=homology_residual"
+            )
+        preservation_mask = _homology_preservation_mask(batch, config)
+        if preservation_mask.any():
+            preservation = F.smooth_l1_loss(
+                normal["mean"][preservation_mask],
+                normal["baseline_mean"][preservation_mask].detach(),
+            )
     total = (
         normal_weight * normal_loss
         + low_weight * low_loss
         + consistency_weight * consistency
+        + preservation_weight * preservation
     )
     components = {
         **{f"normal_{name}": value for name, value in normal_components.items()},
         **{f"low_homology_{name}": value for name, value in low_components.items()},
         "consistency": consistency.detach(),
+        "preservation": preservation.detach(),
     }
     return total, components
+
+
+def _homology_preservation_mask(batch, config):
+    scope = str(
+        get(config, "homology_training.preservation_scope", "high_homology")
+    ).lower()
+    retrieval = batch["retrieval"]
+    if scope == "all":
+        return torch.ones(len(retrieval), dtype=torch.bool, device=retrieval.device)
+    if scope != "high_homology":
+        raise ValueError(
+            "homology_training.preservation_scope must be 'high_homology' or 'all'"
+        )
+    identity = _fraction_threshold(
+        get(
+            config,
+            "homology_training.preservation_identity",
+            get(config, "retrieval.low_homology_identity", 0.2),
+        ),
+        "homology_training.preservation_identity",
+    )
+    coverage = _fraction_threshold(
+        get(
+            config,
+            "homology_training.preservation_coverage",
+            get(config, "retrieval.low_homology_coverage", 0.8),
+        ),
+        "homology_training.preservation_coverage",
+    )
+    return (
+        (retrieval[:, 4] >= identity)
+        & (retrieval[:, 9] >= coverage)
+        & (retrieval[:, 10] >= coverage)
+    )
+
+
+def _fraction_threshold(value, name):
+    threshold = float(value)
+    if threshold > 1:
+        threshold /= 100.0
+    if not 0 <= threshold <= 1:
+        raise ValueError(f"{name} must be a fraction or percentage")
+    return threshold
 
 
 def _gate_regularization(outputs, labels, config):

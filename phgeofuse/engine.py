@@ -635,6 +635,13 @@ def load_initial_checkpoint(source, model):
     if payload.get("saprot_adapter_only", False):
         raise RuntimeError("init_checkpoint does not support adapter-only checkpoints")
     module = model.module if hasattr(model, "module") else model
+    if module.fusion_mode == "homology_residual" and any(
+        name.startswith("homology_gate.") for name in payload["model_state_dict"]
+    ):
+        raise RuntimeError(
+            "homology_residual must be initialized from a baseline checkpoint "
+            "without homology_gate weights; use --resume for a v2 checkpoint"
+        )
     incompatible = module.load_state_dict(payload["model_state_dict"], strict=False)
     invalid_missing = [
         name for name in incompatible.missing_keys
@@ -659,9 +666,13 @@ def _configure_trainable_scope(model, config, *, resume=None, init_checkpoint=No
             "training.trainable_scope=homology_gate requires --init-checkpoint or --resume"
         )
     module = model.module if hasattr(model, "module") else model
-    if module.fusion_mode != "homology_reliability" or module.homology_gate is None:
+    if (
+        module.fusion_mode not in {"homology_reliability", "homology_residual"}
+        or module.homology_gate is None
+    ):
         raise ValueError(
-            "homology_gate scope requires fusion.mode=homology_reliability"
+            "homology_gate scope requires fusion.mode=homology_reliability "
+            "or homology_residual"
         )
     for parameter in module.parameters():
         parameter.requires_grad_(False)
