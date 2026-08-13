@@ -299,30 +299,38 @@ retrieval features remain compatible with existing models; coverage, hit-rate,
 and similarity-margin diagnostics are appended for the new gate. An existing
 v1 cache is rebuilt automatically the first time this configuration is used.
 
-The recommended v2 configuration keeps the tuned-v1 learned gate as a frozen
+The recommended v3 configuration keeps the tuned-v1 learned gate as a frozen
 baseline and adds a zero-initialized homology residual to its logits. Therefore
 the model exactly reproduces tuned-v1 fusion before the first optimizer update.
 Training also anchors high-homology normal-view predictions to that frozen
-baseline while allowing controlled corrections on unreliable retrievals. It
-uses `0.25` low-homology loss weight, `0.5` preservation weight, `2e-5` learning
-rate, and five-epoch early stopping. SaProt, EGNN, the decoder, and the baseline
-gate remain frozen.
+baseline while allowing controlled corrections on unreliable retrievals. After
+each epoch, the validation set selects a residual scale from a fixed grid. The
+grid includes zero, so a residual that does not improve validation RMSE by at
+least `0.002` is disabled and the checkpoint falls back to the frozen baseline
+gate. Among scales within `0.0011` RMSE of the validation optimum, training
+picks the smallest scale to reduce gate variance while remaining stable to
+BF16 evaluation noise. The selected scale is stored in the checkpoint and
+restored for evaluation. Checkpointing always preserves the
+numerically best validation result, while early stopping separately requires
+at least `0.001` RMSE improvement so BF16 evaluation noise cannot keep a
+non-improving run alive. SaProt, EGNN, the decoder, and the baseline gate remain
+frozen.
 
-Initialize v2 directly from the matching tuned-v1 checkpoint:
+Initialize v3 directly from the matching tuned-v1 checkpoint:
 
 ```bash
 conda activate phbench
 
 # Original PHOPT split.
 python -m phgeofuse.train \
-  --config configs/phgeofuse_phopt_homology_gate_v2.yaml \
+  --config configs/phgeofuse_phopt_homology_gate_v3.yaml \
   --dataset phopt \
   --init-checkpoint \
     artifacts/phgeofuse/runs/phgeofuse_phopt_tuned_mse_v1_frozen_seed42/best.pt
 
 # Strict identity20 split.
 python -m phgeofuse.train \
-  --config configs/phgeofuse_phopt_homology_gate_v2.yaml \
+  --config configs/phgeofuse_phopt_homology_gate_v3.yaml \
   --dataset identity20 \
   --init-checkpoint \
     artifacts/phgeofuse/datasets/identity20/runs/phgeofuse_phopt_tuned_mse_v1_frozen_seed42/best.pt
@@ -333,18 +341,24 @@ datasets were rebuilt from the merged PHOPT records, so the two split systems
 overlap across train and test. Train separate checkpoints with the same recipe
 and select each checkpoint only with its own validation set.
 
-Do not resume a v1 homology-gate checkpoint into v2: v1 gate logits were
-absolute, whereas v2 gate logits are residual corrections. Start v2 from the
-tuned-v1 checkpoint as shown above. Resume only a v2 `last.pt` with `--resume`.
+Do not resume a v1 homology-gate checkpoint into v3: v1 gate logits were
+absolute, whereas v3 gate logits are residual corrections. Start v3 from the
+tuned-v1 checkpoint as shown above. Resume only a v3 `last.pt` with `--resume`.
 
 Evaluate the resulting checkpoints with their matching dataset:
 
 ```bash
-python -m phgeofuse.evaluate \
-  --config configs/phgeofuse_phopt_homology_gate_v2.yaml \
+python -m phgeofuse.calibrate \
+  --config configs/phgeofuse_phopt_homology_gate_v3.yaml \
   --dataset identity20 \
   --checkpoint \
-    artifacts/phgeofuse/datasets/identity20/runs/phgeofuse_phopt_homology_gate_v2_frozen_seed42/best.pt \
+    artifacts/phgeofuse/datasets/identity20/runs/phgeofuse_phopt_homology_gate_v3_shrinkage_frozen_seed42/best.pt
+
+python -m phgeofuse.evaluate \
+  --config configs/phgeofuse_phopt_homology_gate_v3.yaml \
+  --dataset identity20 \
+  --checkpoint \
+    artifacts/phgeofuse/datasets/identity20/runs/phgeofuse_phopt_homology_gate_v3_shrinkage_frozen_seed42/best_calibrated.pt \
   --split test
 ```
 

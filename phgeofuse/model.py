@@ -151,6 +151,13 @@ class PHGeoFuse(nn.Module):
         self.gate = nn.Sequential(nn.Linear(6, 64), nn.SiLU(), nn.Dropout(0.1), nn.Linear(64, 3))
         self.reliability_gate = None
         self.homology_gate = None
+        self.register_buffer(
+            "homology_residual_scale",
+            torch.tensor(float(get(config, "fusion.residual_scale", 1.0))),
+            persistent=False,
+        )
+        if not 0.0 <= float(self.homology_residual_scale) <= 1.0:
+            raise ValueError("fusion.residual_scale must be between zero and one")
         self.gate_temperature = float(get(config, "fusion.gate_temperature", 1.0))
         if self.gate_temperature <= 0:
             raise ValueError("fusion.gate_temperature must be positive")
@@ -340,11 +347,20 @@ class PHGeoFuse(nn.Module):
                 )
                 baseline_gate_weights = torch.softmax(baseline_logits, dim=-1)
                 baseline_mean = (baseline_gate_weights * expert_means).sum(dim=-1)
-                gate_logits = baseline_logits + residual_logits / self.gate_temperature
+                residual_scale = (
+                    residual_logits.new_tensor(1.0)
+                    if self.homology_gate.training
+                    else self.homology_residual_scale.to(residual_logits)
+                )
+                gate_logits = (
+                    baseline_logits
+                    + residual_scale * residual_logits / self.gate_temperature
+                )
                 fusion_details = {
                     "baseline_mean": baseline_mean,
                     "baseline_gate_weights": baseline_gate_weights,
                     "homology_residual_logits": residual_logits,
+                    "homology_residual_scale": residual_scale,
                 }
             else:
                 gate_logits = residual_logits / self.gate_temperature

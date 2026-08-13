@@ -230,12 +230,14 @@ def train_model(
     )
     amp_dtype = _amp_dtype(config, context.device)
     scaler = torch.cuda.amp.GradScaler(enabled=context.device.type == "cuda" and amp_dtype == torch.float16)
-    start_epoch, global_step, best_rmse, stale = 0, 0, math.inf, 0
+    start_epoch, global_step = 0, 0
+    best_rmse, patience_rmse, stale = math.inf, math.inf, 0
     if resume:
         state = load_checkpoint(resume, model, optimizer, scheduler, scaler)
         start_epoch = int(state.get("epoch", -1)) + 1
         global_step = int(state.get("global_step", 0))
         best_rmse = float(state.get("best_rmse", math.inf))
+        patience_rmse = float(state.get("patience_rmse", best_rmse))
         stale = int(state.get("stale_epochs", 0))
 
     run_dir = _run_dir(config)
@@ -243,6 +245,9 @@ def train_model(
         run_dir.mkdir(parents=True, exist_ok=True)
         save_resolved(config, run_dir / "config.resolved.yaml")
     patience = int(get(config, "training.early_stopping_patience", 15))
+    min_delta = float(get(config, "training.early_stopping_min_delta", 0.0))
+    if min_delta < 0:
+        raise ValueError("training.early_stopping_min_delta must be non-negative")
     clip = float(get(config, "training.gradient_clip", 1.0))
     for epoch in range(start_epoch, epochs):
         if train_sampler is not None:
@@ -294,6 +299,9 @@ def train_model(
             for name, value in running_component_sums.items()
         }
         validation = evaluate_loader(model, loaders["validation"], config, context, include_loss=True)
+        validation = select_homology_residual_scale(
+            model, validation, config, context
+        )
         train_evaluation = None
         if "train_evaluation" in loaders:
             rng_state = _capture_rng_state()
@@ -306,12 +314,14 @@ def train_model(
         )
         context.broadcast(validation_rmse, source=0)
         validation["metrics"]["rmse"] = float(validation_rmse)
-        improved = float(validation_rmse) < best_rmse
-        if improved:
-            best_rmse = float(validation_rmse)
-            stale = 0
-        else:
-            stale += 1
+        (
+            best_rmse,
+            patience_rmse,
+            stale,
+            checkpoint_improved,
+        ) = _update_validation_tracking(
+            float(validation_rmse), best_rmse, patience_rmse, stale, min_delta
+        )
         if context.is_main:
             row = {
                 "epoch": epoch, "global_step": global_step, "train_loss": train_loss,
@@ -336,10 +346,11 @@ def train_model(
             with (run_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, sort_keys=True) + "\n")
             checkpoint = checkpoint_payload(
-                model, optimizer, scheduler, scaler, config, epoch, global_step, best_rmse, stale, context.world_size
+                model, optimizer, scheduler, scaler, config, epoch, global_step,
+                best_rmse, patience_rmse, stale, context.world_size
             )
             atomic_torch_save(run_dir / "last.pt", checkpoint)
-            if improved:
+            if checkpoint_improved:
                 atomic_torch_save(run_dir / "best.pt", checkpoint)
             train_rmse = (
                 f" train_rmse={train_evaluation['metrics']['rmse']:.4f}"
@@ -378,8 +389,7 @@ def evaluate_loader(model, loader, config, context, include_loss: bool = False):
                         )
             for index, key in enumerate(batch["keys"]):
                 retrieval = batch["retrieval"][index]
-                local_rows.append(
-                    {
+                row = {
                         "key": key,
                         "label": float(batch["labels"][index]),
                         "prediction": float(outputs["mean"][index]),
@@ -400,11 +410,50 @@ def evaluate_loader(model, loader, config, context, include_loss: bool = False):
                         "saprot_similarity_margin": float(retrieval[13]),
                         "foldseek_similarity_margin": float(retrieval[14]),
                     }
-                )
+                if "homology_residual_logits" in outputs:
+                    row.update(
+                        {
+                            "_expert_means": outputs["expert_means"][index]
+                            .float()
+                            .cpu()
+                            .tolist(),
+                            "_expert_variances": torch.stack(
+                                [
+                                    outputs["global_variance"][index],
+                                    retrieval[5],
+                                    retrieval[6],
+                                ]
+                            )
+                            .float()
+                            .cpu()
+                            .tolist(),
+                            "_expert_available": outputs["expert_available"][index]
+                            .cpu()
+                            .tolist(),
+                            "_baseline_gate_weights": outputs[
+                                "baseline_gate_weights"
+                            ][index]
+                            .float()
+                            .cpu()
+                            .tolist(),
+                            "_homology_residual_logits": outputs[
+                                "homology_residual_logits"
+                            ][index]
+                            .float()
+                            .cpu()
+                            .tolist(),
+                        }
+                    )
+                local_rows.append(row)
     rows = _gather_rows(local_rows, context)
     result = {"rows": rows if context.is_main else []}
     if context.is_main:
         result["metrics"] = prediction_metrics(rows, config)
+        module = model.module if hasattr(model, "module") else model
+        if module.fusion_mode == "homology_residual":
+            result["metrics"]["homology_residual_scale"] = float(
+                module.homology_residual_scale
+            )
     else:
         result["metrics"] = {}
     if include_loss:
@@ -441,6 +490,52 @@ def evaluate_checkpoint(records, config, checkpoint_path, context, split="test",
         print(json.dumps(result["metrics"], indent=2, sort_keys=True))
     context.barrier()
     return result
+
+
+def calibrate_checkpoint(records, config, checkpoint_path, context, output=None):
+    """Select deployment-time residual shrinkage using validation data."""
+    retrieval = RetrievalStore.load(path(config, "paths.retrieval"))
+    loaders, _ = build_loaders(records, retrieval, config, context)
+    if len(loaders["validation"].dataset) == 0:
+        raise ValueError("validation split must contain ready proteins")
+    model = PHGeoFuse(config, context.device).to(context.device)
+    payload = load_checkpoint(checkpoint_path, model)
+    if context.distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[context.local_rank] if context.device.type == "cuda" else None,
+            output_device=context.local_rank if context.device.type == "cuda" else None,
+        )
+    validation = evaluate_loader(model, loaders["validation"], config, context)
+    validation = select_homology_residual_scale(
+        model, validation, config, context
+    )
+    destination = None
+    if context.is_main:
+        destination = (
+            Path(output)
+            if output
+            else Path(checkpoint_path).with_name(
+                f"{Path(checkpoint_path).stem}_calibrated.pt"
+            )
+        )
+        calibrated = dict(payload)
+        calibrated["homology_residual_scale"] = float(
+            validation["metrics"]["homology_residual_scale"]
+        )
+        calibrated["calibration"] = {
+            "split": "validation",
+            "metrics": validation["metrics"],
+        }
+        atomic_torch_save(destination, calibrated)
+        atomic_json(
+            destination.with_suffix(".calibration.metrics.json"),
+            validation["metrics"],
+        )
+        print(json.dumps(validation["metrics"], indent=2, sort_keys=True))
+        print(f"Calibrated checkpoint: {destination}")
+    context.barrier()
+    return destination
 
 
 def regression_metrics(labels: np.ndarray, predictions: np.ndarray) -> dict[str, float]:
@@ -574,6 +669,125 @@ def prediction_metrics(rows, config=None):
     return metrics
 
 
+def select_homology_residual_scale(model, evaluation, config, context):
+    """Shrink a learned residual gate using validation predictions only."""
+    if str(get(config, "fusion.mode", "learned")).lower() != "homology_residual":
+        return evaluation
+    raw_grid = get(config, "homology_training.residual_scale_grid")
+    if raw_grid is None:
+        return evaluation
+    if not isinstance(raw_grid, list) or not raw_grid:
+        raise ValueError(
+            "homology_training.residual_scale_grid must be a non-empty list"
+        )
+    grid = sorted({float(value) for value in raw_grid})
+    if any(not 0.0 <= value <= 1.0 for value in grid) or 0.0 not in grid:
+        raise ValueError(
+            "homology_training.residual_scale_grid must contain zero and values "
+            "between zero and one"
+        )
+
+    selected_scale = 0.0
+    if context.is_main:
+        rows = evaluation["rows"]
+        if rows and "_homology_residual_logits" not in rows[0]:
+            raise ValueError(
+                "residual-scale selection requires homology residual diagnostics"
+            )
+        candidates = []
+        for scale in grid:
+            candidate_rows = _apply_homology_residual_scale(rows, scale, config)
+            candidate_metrics = prediction_metrics(candidate_rows, config)
+            candidates.append((candidate_metrics["rmse"], scale, candidate_rows, candidate_metrics))
+        best_candidate = min(
+            candidates, key=lambda item: (item[0], item[1])
+        )
+        tolerance = float(
+            get(config, "homology_training.residual_scale_simplicity_tolerance", 0.0)
+        )
+        if tolerance < 0:
+            raise ValueError(
+                "homology_training.residual_scale_simplicity_tolerance must be non-negative"
+            )
+        eligible = [
+            item for item in candidates if item[0] <= best_candidate[0] + tolerance
+        ]
+        _, selected_scale, selected_rows, selected_metrics = min(
+            eligible, key=lambda item: item[1]
+        )
+        baseline_rmse = next(item[0] for item in candidates if item[1] == 0.0)
+        minimum_improvement = float(
+            get(config, "homology_training.residual_scale_min_improvement", 0.0)
+        )
+        if minimum_improvement < 0:
+            raise ValueError(
+                "homology_training.residual_scale_min_improvement must be non-negative"
+            )
+        if baseline_rmse - selected_metrics["rmse"] < minimum_improvement:
+            _, selected_scale, selected_rows, selected_metrics = next(
+                item for item in candidates if item[1] == 0.0
+            )
+        selected_metrics["homology_residual_scale"] = selected_scale
+        selected_metrics["homology_residual_baseline_rmse"] = baseline_rmse
+        selected_metrics["homology_residual_best_candidate_rmse"] = best_candidate[0]
+        selected_metrics["homology_residual_scale_simplicity_tolerance"] = tolerance
+        selected_metrics["homology_residual_scale_rmse"] = {
+            str(scale): rmse for rmse, scale, _, _ in candidates
+        }
+        evaluation["rows"] = selected_rows
+        evaluation["metrics"] = selected_metrics
+
+    scale_tensor = torch.tensor(selected_scale, device=context.device)
+    context.broadcast(scale_tensor, source=0)
+    _set_homology_residual_scale(model, float(scale_tensor))
+    return evaluation
+
+
+def _update_validation_tracking(rmse, best_rmse, patience_rmse, stale, min_delta):
+    checkpoint_improved = rmse < best_rmse
+    if checkpoint_improved:
+        best_rmse = rmse
+    if rmse < patience_rmse - min_delta:
+        patience_rmse = rmse
+        stale = 0
+    else:
+        stale += 1
+    return best_rmse, patience_rmse, stale, checkpoint_improved
+
+
+def _apply_homology_residual_scale(rows, scale, config):
+    temperature = float(get(config, "fusion.gate_temperature", 1.0))
+    adjusted = []
+    for source in rows:
+        row = dict(source)
+        baseline = np.asarray(row["_baseline_gate_weights"], dtype=np.float64)
+        residual = np.asarray(row["_homology_residual_logits"], dtype=np.float64)
+        available = np.asarray(row["_expert_available"], dtype=bool)
+        logits = np.log(np.clip(baseline, 1e-30, None)) + scale * residual / temperature
+        logits[~available] = -np.inf
+        finite = np.isfinite(logits)
+        shifted = logits - np.max(logits[finite])
+        gates = np.where(finite, np.exp(shifted), 0.0)
+        gates /= gates.sum()
+        means = np.asarray(row["_expert_means"], dtype=np.float64)
+        variances = np.asarray(row["_expert_variances"], dtype=np.float64)
+        prediction = float(np.dot(gates, means))
+        variance = float(
+            np.dot(gates, variances + np.square(means - prediction))
+        )
+        row.update(
+            {
+                "prediction": prediction,
+                "uncertainty": math.sqrt(max(0.0, variance)),
+                "global_gate": float(gates[0]),
+                "saprot_gate": float(gates[1]),
+                "foldseek_gate": float(gates[2]),
+            }
+        )
+        adjusted.append(row)
+    return adjusted
+
+
 def _safe_pearson(left, right):
     left = np.asarray(left, dtype=np.float64)
     right = np.asarray(right, dtype=np.float64)
@@ -583,7 +797,10 @@ def _safe_pearson(left, right):
     return value if math.isfinite(value) else 0.0
 
 
-def checkpoint_payload(model, optimizer, scheduler, scaler, config, epoch, global_step, best_rmse, stale, world_size):
+def checkpoint_payload(
+    model, optimizer, scheduler, scaler, config, epoch, global_step,
+    best_rmse, patience_rmse, stale, world_size,
+):
     module = model.module if hasattr(model, "module") else model
     model_state = module.state_dict()
     adapter_only = getattr(module, "mode", "frozen") == "lora"
@@ -599,8 +816,10 @@ def checkpoint_payload(model, optimizer, scheduler, scaler, config, epoch, globa
         "saprot_adapter_only": adapter_only,
         "optimizer_state_dict": optimizer.state_dict(), "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(), "epoch": epoch, "global_step": global_step,
-        "best_rmse": best_rmse, "stale_epochs": stale, "config": config,
+        "best_rmse": best_rmse, "patience_rmse": patience_rmse,
+        "stale_epochs": stale, "config": config,
         "config_hash": config_hash(config), "world_size": world_size,
+        "homology_residual_scale": float(module.homology_residual_scale),
         "rng": _capture_rng_state(),
     }
 
@@ -610,6 +829,9 @@ def load_checkpoint(source, model, optimizer=None, scheduler=None, scaler=None):
     module = model.module if hasattr(model, "module") else model
     incompatible = module.load_state_dict(
         payload["model_state_dict"], strict=not payload.get("saprot_adapter_only", False)
+    )
+    _set_homology_residual_scale(
+        module, float(payload.get("homology_residual_scale", 1.0))
     )
     if payload.get("saprot_adapter_only", False):
         unexpected = list(incompatible.unexpected_keys)
@@ -687,6 +909,13 @@ def _set_training_mode(model, config):
     model.eval()
     module = model.module if hasattr(model, "module") else model
     module.homology_gate.train()
+
+
+def _set_homology_residual_scale(model, scale):
+    module = model.module if hasattr(model, "module") else model
+    if not 0.0 <= scale <= 1.0:
+        raise ValueError("homology residual scale must be between zero and one")
+    module.homology_residual_scale.fill_(scale)
 
 
 def apply_ablation(config: dict[str, Any], name: str) -> None:
@@ -767,7 +996,14 @@ def _run_dir(config):
 
 def _write_predictions(destination, rows):
     destination.parent.mkdir(parents=True, exist_ok=True)
+    public_rows = [
+        {name: value for name, value in row.items() if not name.startswith("_")}
+        for row in rows
+    ]
     with destination.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]) if rows else ["key", "prediction"])
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=list(public_rows[0]) if public_rows else ["key", "prediction"],
+        )
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(public_rows)

@@ -33,17 +33,36 @@ from phgeofuse.structures import (
     sequence_matches,
 )
 from phgeofuse.engine import (
+    _apply_homology_residual_scale,
     _configure_trainable_scope,
     _set_training_mode,
+    _update_validation_tracking,
+    calibrate_checkpoint,
     load_checkpoint,
     load_initial_checkpoint,
     resolve_evaluation_split,
+    select_homology_residual_scale,
     train_model,
 )
 from utils.distributed import DistributedContext
 
 
 class PHGeoFuseTests(unittest.TestCase):
+    def test_checkpoint_improvement_is_independent_of_patience_delta(self):
+        state = _update_validation_tracking(
+            rmse=0.9995,
+            best_rmse=1.0,
+            patience_rmse=1.0,
+            stale=2,
+            min_delta=0.001,
+        )
+
+        best_rmse, patience_rmse, stale, checkpoint_improved = state
+        self.assertEqual(best_rmse, 0.9995)
+        self.assertEqual(patience_rmse, 1.0)
+        self.assertEqual(stale, 3)
+        self.assertTrue(checkpoint_improved)
+
     def test_phopt_fasta_parser(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "sample.fasta"
@@ -511,6 +530,147 @@ class PHGeoFuseTests(unittest.TestCase):
             atol=0,
         )
 
+    def test_zero_residual_scale_restores_learned_gate_after_training(self):
+        source_config = _tiny_config()
+        source_model = PHGeoFuse(source_config, torch.device("cpu"))
+        target_config = copy.deepcopy(source_config)
+        target_config["fusion"] = {
+            "mode": "homology_residual",
+            "gate_hidden_dim": 16,
+            "gate_dropout": 0.0,
+            "gate_temperature": 1.5,
+        }
+        target_model = PHGeoFuse(target_config, torch.device("cpu"))
+        target_model.load_state_dict(source_model.state_dict(), strict=False)
+        with torch.no_grad():
+            target_model.homology_gate[-1].bias.copy_(
+                torch.tensor([-2.0, 1.0, 1.0])
+            )
+            target_model.homology_residual_scale.zero_()
+        source_model.eval()
+        target_model.eval()
+        batch = _tiny_batch()
+
+        source = source_model(batch)
+        target = target_model(batch)
+
+        torch.testing.assert_close(target["mean"], source["mean"], rtol=0, atol=0)
+        torch.testing.assert_close(
+            target["gate_weights"], source["gate_weights"], rtol=0, atol=0
+        )
+
+    def test_validation_scale_selection_falls_back_to_baseline(self):
+        config = _tiny_config()
+        config["fusion"] = {
+            "mode": "homology_residual",
+            "gate_temperature": 1.0,
+        }
+        config["homology_training"] = {
+            "enabled": True,
+            "residual_scale_grid": [0.0, 0.5, 1.0],
+            "residual_scale_min_improvement": 0.0,
+        }
+        model = PHGeoFuse(config, torch.device("cpu"))
+        context = DistributedContext(False, 0, 0, 1, torch.device("cpu"))
+        rows = []
+        for label, experts in ((6.0, [6.0, 8.0, 8.0]), (8.0, [8.0, 6.0, 6.0])):
+            rows.append(
+                {
+                    "key": str(label),
+                    "label": label,
+                    "prediction": label,
+                    "global_prediction": experts[0],
+                    "saprot_prediction": experts[1],
+                    "foldseek_prediction": experts[2],
+                    "saprot_available": True,
+                    "foldseek_available": True,
+                    "uncertainty": 0.0,
+                    "global_gate": 0.98,
+                    "saprot_gate": 0.01,
+                    "foldseek_gate": 0.01,
+                    "sequence_identity": 0.1,
+                    "query_coverage": 0.5,
+                    "target_coverage": 0.5,
+                    "_expert_means": experts,
+                    "_expert_variances": [0.0, 0.0, 0.0],
+                    "_expert_available": [True, True, True],
+                    "_baseline_gate_weights": [0.98, 0.01, 0.01],
+                    "_homology_residual_logits": [-10.0, 10.0, 10.0],
+                }
+            )
+        baseline_rows = _apply_homology_residual_scale(rows, 0.0, config)
+        evaluation = {"rows": rows, "metrics": {}}
+
+        selected = select_homology_residual_scale(
+            model, evaluation, config, context
+        )
+
+        self.assertEqual(selected["metrics"]["homology_residual_scale"], 0.0)
+        self.assertEqual(float(model.homology_residual_scale), 0.0)
+        self.assertEqual(
+            [row["prediction"] for row in selected["rows"]],
+            [row["prediction"] for row in baseline_rows],
+        )
+        self.assertGreater(
+            selected["metrics"]["homology_residual_scale_rmse"]["1.0"],
+            selected["metrics"]["rmse"],
+        )
+
+    def test_validation_scale_selection_prefers_simpler_near_optimum(self):
+        config = _tiny_config()
+        config["fusion"] = {
+            "mode": "homology_residual",
+            "gate_temperature": 1.0,
+        }
+        config["homology_training"] = {
+            "enabled": True,
+            "residual_scale_grid": [0.0, 0.5, 1.0],
+            "residual_scale_min_improvement": 0.0,
+        }
+        model = PHGeoFuse(config, torch.device("cpu"))
+        context = DistributedContext(False, 0, 0, 1, torch.device("cpu"))
+        rows = []
+        for label, experts in ((6.0, [8.0, 6.0, 6.0]), (8.0, [6.0, 8.0, 8.0])):
+            rows.append(
+                {
+                    "key": str(label), "label": label,
+                    "prediction": experts[0],
+                    "global_prediction": experts[0],
+                    "saprot_prediction": experts[1],
+                    "foldseek_prediction": experts[2],
+                    "saprot_available": True, "foldseek_available": True,
+                    "uncertainty": 0.0,
+                    "global_gate": 0.98, "saprot_gate": 0.01,
+                    "foldseek_gate": 0.01,
+                    "sequence_identity": 0.1,
+                    "query_coverage": 0.5, "target_coverage": 0.5,
+                    "_expert_means": experts,
+                    "_expert_variances": [0.0, 0.0, 0.0],
+                    "_expert_available": [True, True, True],
+                    "_baseline_gate_weights": [0.98, 0.01, 0.01],
+                    "_homology_residual_logits": [-4.0, 2.0, 2.0],
+                }
+            )
+        rmses = {}
+        for scale in (0.0, 0.5, 1.0):
+            adjusted = _apply_homology_residual_scale(rows, scale, config)
+            rmses[scale] = math.sqrt(
+                sum((row["prediction"] - row["label"]) ** 2 for row in adjusted)
+                / len(adjusted)
+            )
+        self.assertLess(rmses[1.0], rmses[0.5])
+        self.assertLess(rmses[0.5], rmses[0.0])
+        config["homology_training"]["residual_scale_simplicity_tolerance"] = (
+            rmses[0.5] - rmses[1.0] + 1e-6
+        )
+
+        selected = select_homology_residual_scale(
+            model, {"rows": rows, "metrics": {}}, config, context
+        )
+
+        self.assertEqual(selected["metrics"]["homology_residual_scale"], 0.5)
+        self.assertEqual(float(model.homology_residual_scale), 0.5)
+
     def test_dual_view_loss_uses_configured_weights(self):
         config = _tiny_config()
         config["fusion"] = {"mode": "homology_reliability", "gate_dropout": 0.0}
@@ -807,6 +967,8 @@ class PHGeoFuseTests(unittest.TestCase):
                         "preservation_scope": "high_homology",
                         "preservation_identity": 0.2,
                         "preservation_coverage": 0.8,
+                        "residual_scale_grid": [0.0, 0.5, 1.0],
+                        "residual_scale_min_improvement": 0.0,
                     },
                     "training": {
                         "seed": 11,
@@ -852,6 +1014,33 @@ class PHGeoFuseTests(unittest.TestCase):
             self.assertIn("low_homology_mse", metrics["train_loss_components"])
             self.assertIn("preservation", metrics["train_loss_components"])
             self.assertIn("consistency", metrics["train_loss_components"])
+            self.assertIn("homology_residual_scale", metrics["validation"])
+            payload = torch.load(checkpoint, map_location="cpu")
+            self.assertIn("homology_residual_scale", payload)
+            restored = PHGeoFuse(config, torch.device("cpu"))
+            load_checkpoint(checkpoint, restored)
+            self.assertEqual(
+                float(restored.homology_residual_scale),
+                payload["homology_residual_scale"],
+            )
+
+            calibrated = root / "calibrated.pt"
+            calibrate_checkpoint(
+                records, config, checkpoint, context, output=calibrated
+            )
+            calibrated_payload = torch.load(calibrated, map_location="cpu")
+            self.assertEqual(
+                calibrated_payload["calibration"]["split"], "validation"
+            )
+            self.assertEqual(
+                calibrated_payload["homology_residual_scale"],
+                calibrated_payload["calibration"]["metrics"][
+                    "homology_residual_scale"
+                ],
+            )
+            self.assertTrue(
+                calibrated.with_suffix(".calibration.metrics.json").is_file()
+            )
 
     def test_train_diagnostics_do_not_change_parameter_updates(self):
         with tempfile.TemporaryDirectory() as directory:
