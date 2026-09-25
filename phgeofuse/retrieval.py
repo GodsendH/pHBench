@@ -190,6 +190,7 @@ class RetrievalStore:
         top_k = int(get(config, "retrieval.top_k", 5))
         payload = {
             "schema_version": RETRIEVAL_SCHEMA_VERSION,
+            "dataset_fingerprint": get(config, "data.dataset_fingerprint"),
             "build_signature": retrieval_build_signature(config),
             "rows": rows,
             "training_keys": [record_key(record) for record in training],
@@ -434,7 +435,10 @@ def _cosine_neighbors(query: torch.Tensor, target: torch.Tensor, top_k: int):
 
 def _mmseqs_hits(records, training, config):
     binary = shutil.which(str(get(config, "retrieval.mmseqs_binary", "mmseqs")))
+    required = bool(get(config, "retrieval.require_mmseqs", False))
     if binary is None:
+        if required:
+            raise FileNotFoundError("MMseqs is required for this homology evaluation")
         return {}
     with tempfile.TemporaryDirectory(prefix="phgeofuse-mmseqs-") as directory:
         root = Path(directory)
@@ -448,8 +452,12 @@ def _mmseqs_hits(records, training, config):
                    "-s", str(float(get(config, "retrieval.search_sensitivity", 7.5))),
                    "--alignment-mode", "3",
                    "--format-output", "query,target,fident,qcov,tcov,bits", "-v", "0"]
+        if get(config, "retrieval.search_threads", None) is not None:
+            command.extend(["--threads", str(int(get(config, "retrieval.search_threads")))])
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
+            if required:
+                raise RuntimeError(f"MMseqs retrieval failed: {result.stderr.strip()}")
             return {}
         hits: dict[tuple[str, str], SequenceHit] = {}
         for line in output.read_text().splitlines():
@@ -484,6 +492,8 @@ def _foldseek_hits(records, training, config):
         command = [binary, "easy-search", str(query_dir), str(train_dir), str(output), str(root / "tmp"),
                    "--max-seqs", str(candidate_k),
                    "--format-output", "query,target,bits", "-v", "0"]
+        if get(config, "retrieval.search_threads", None) is not None:
+            command.extend(["--threads", str(int(get(config, "retrieval.search_threads")))])
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
             if required:
@@ -506,6 +516,11 @@ def ensure_retrieval_store(records, config, force: bool = False):
         store = RetrievalStore.load(destination)
         expected = {record_key(record) for record in records if record.status == "ready"}
         compatible = expected <= set(store.rows)
+        fingerprint = get(config, 'data.dataset_fingerprint')
+        if fingerprint:
+            compatible = (compatible and store.payload.get('dataset_fingerprint') == fingerprint
+                          and set(store.payload.get('training_keys', [])) ==
+                          {record_key(record) for record in records if record.status == 'ready' and record.split == 'train'})
         if homology_training_enabled(config):
             compatible = (
                 compatible

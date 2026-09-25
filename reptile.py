@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from dataset_registry import DATASET_CHOICES, normalize_dataset_name, processed_dataset_directory
 from models import pHPredictionModel, ProteinpHDataset, SupportDataset
+from models.meta_evaluation import evaluation_state
 from utils import (
     BaseTrainer,
     DistributedMetaBatchSampler,
@@ -105,7 +106,7 @@ class ReptileTrainer(BaseTrainer):
         self.distributed_context.broadcast(vector, source=0)
         self._load_trainable_vector(vector)
 
-    def _adapt_current_model(self, task_data):
+    def _adapt_current_model(self, task_data, shuffle=True):
         support_dataset = SupportDataset(
             task_data['env_ids'],
             task_data['env_seqs'],
@@ -114,7 +115,7 @@ class ReptileTrainer(BaseTrainer):
         support_loader = DataLoader(
             support_dataset,
             batch_size=self.support_batch_size,
-            shuffle=True,
+            shuffle=shuffle,
             generator=self.support_generator,
         )
 
@@ -283,7 +284,6 @@ class ReptileTrainer(BaseTrainer):
         self.synchronize_trainable_parameters()
 
     def validate(self):
-        base_vector = self._snapshot_trainable_vector()
         local_loss_sum = 0.0
         local_task_count = 0
         progress = tqdm(
@@ -292,15 +292,17 @@ class ReptileTrainer(BaseTrainer):
             disable=not self.is_main,
         )
 
-        for batch in progress:
-            for task_data in batch:
-                self._load_trainable_vector(base_vector)
-                self._adapt_current_model(task_data)
-                query_loss, _, _ = self._query_task(task_data)
-                local_loss_sum += query_loss
-                local_task_count += 1
+        with evaluation_state(
+            self.model, self.support_generator, restore_parameters=True,
+        ) as restore:
+            for batch in progress:
+                for task_data in batch:
+                    restore()
+                    self._adapt_current_model(task_data, shuffle=False)
+                    query_loss, _, _ = self._query_task(task_data)
+                    local_loss_sum += query_loss
+                    local_task_count += 1
 
-        self._load_trainable_vector(base_vector)
         statistics = torch.tensor(
             [local_loss_sum, float(local_task_count)],
             dtype=torch.float64,
@@ -315,25 +317,26 @@ class ReptileTrainer(BaseTrainer):
         if not self.is_main:
             return []
 
-        base_vector = self._snapshot_trainable_vector()
         predictions = []
         true_pHs = []
         predicted_pHs = []
 
-        for batch in tqdm(self.test_loader, desc='Testing'):
-            for task_data in batch:
-                self._load_trainable_vector(base_vector)
-                self._adapt_current_model(task_data)
-                _, predicted_pH, true_pH = self._query_task(task_data)
-                predictions.append({
-                    'opt_id': task_data['opt_id'],
-                    'true_pH': true_pH,
-                    'predicted_pH': predicted_pH,
-                })
-                true_pHs.append(true_pH)
-                predicted_pHs.append(predicted_pH)
+        with evaluation_state(
+            self.model, self.support_generator, restore_parameters=True,
+        ) as restore:
+            for batch in tqdm(self.test_loader, desc='Testing'):
+                for task_data in batch:
+                    restore()
+                    self._adapt_current_model(task_data, shuffle=False)
+                    _, predicted_pH, true_pH = self._query_task(task_data)
+                    predictions.append({
+                        'opt_id': task_data['opt_id'],
+                        'true_pH': true_pH,
+                        'predicted_pH': predicted_pH,
+                    })
+                    true_pHs.append(true_pH)
+                    predicted_pHs.append(predicted_pH)
 
-        self._load_trainable_vector(base_vector)
         metrics = calculate_metrics(true_pHs, predicted_pHs)
         print_metrics(metrics)
         return predictions

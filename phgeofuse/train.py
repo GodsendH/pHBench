@@ -5,7 +5,7 @@ import argparse
 from dataset_registry import DATASET_CHOICES
 
 from .config import load_config, path
-from .datasets import apply_dataset
+from .datasets import apply_dataset, validate_fixed_test_inputs
 from .engine import apply_ablation, train_model
 from .io import read_manifest
 
@@ -25,6 +25,7 @@ def main():
     apply_ablation(config, args.ablation)
     manifest = args.manifest or path(config, "paths.manifest")
     records = read_manifest(manifest)
+    validate_fixed_test_inputs(records, config, args.resume or args.init_checkpoint)
     from utils.distributed import initialize_distributed
     context = initialize_distributed(args.distributed_backend)
     try:

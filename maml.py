@@ -13,6 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from dataset_registry import DATASET_CHOICES, normalize_dataset_name, processed_dataset_directory
 from models import pHPredictionModel, ProteinpHDataset, SupportDataset
+from models.meta_evaluation import evaluation_state
 from utils import (
     BaseTrainer,
     calculate_metrics,
@@ -45,13 +46,13 @@ class MAMLTrainer(BaseTrainer):
         self.maml = l2l.algorithms.MAML(self.model, lr=self.inner_lr, first_order=False)
         self.optimizer = torch.optim.Adam(self.maml.parameters(), self.meta_lr)
 
-    def adapt_on_support_set(self, learner, task_data):
+    def adapt_on_support_set(self, learner, task_data, shuffle=True):
         accs_spt, x_spt, y_spt = task_data['env_ids'], task_data['env_seqs'], task_data['env_pHs'].to(device)
         support_dataset = SupportDataset(accs_spt, x_spt, y_spt)
         support_loader = DataLoader(
             support_dataset,
             batch_size=self.support_batch_size,
-            shuffle=True,
+            shuffle=shuffle,
             generator=self.support_generator,
         )
         
@@ -71,7 +72,9 @@ class MAMLTrainer(BaseTrainer):
 
     def process_task(self, task_data, train=True):
         learner = self.maml.clone()
-        learner = self.adapt_on_support_set(learner, task_data)
+        if not train:
+            learner.eval()
+        learner = self.adapt_on_support_set(learner, task_data, shuffle=train)
         
         accs_qry = [task_data['opt_id']]
         x_qry = [task_data['opt_seq']]
@@ -130,31 +133,38 @@ class MAMLTrainer(BaseTrainer):
             self.writer.add_scalar('Loss/train_epoch', avg_epoch_loss, epoch)
             self.writer.flush()
 
+        if self.best_model is not None:
+            self.restore_best_model()
+
     def validate(self):
         total_loss = 0.0
-        num_batches = 0
-        for batch in tqdm(self.valid_loader, desc="Validation"):
-            for task_data in batch:
-                qry_loss, _, _ = self.process_task(task_data, train=False)
-                total_loss += qry_loss
-            num_batches += 1
-        return total_loss / num_batches
+        num_tasks = 0
+        with evaluation_state(self.model, self.support_generator):
+            for batch in tqdm(self.valid_loader, desc="Validation"):
+                for task_data in batch:
+                    qry_loss, _, _ = self.process_task(task_data, train=False)
+                    total_loss += qry_loss
+                    num_tasks += 1
+        if num_tasks == 0:
+            raise RuntimeError('The validation dataset is empty.')
+        return total_loss / num_tasks
 
     def test(self):
         predictions = []
         true_pHs = []
         predicted_pHs = []
         
-        for batch in tqdm(self.test_loader, desc="Testing"):
-            for task_data in batch:
-                _, pred_pH, true_pH = self.process_task(task_data, train=False)
-                predictions.append({
-                    'opt_id': task_data['opt_id'],
-                    'true_pH': true_pH,
-                    'predicted_pH': pred_pH
-                })
-                true_pHs.append(true_pH)
-                predicted_pHs.append(pred_pH)
+        with evaluation_state(self.model, self.support_generator):
+            for batch in tqdm(self.test_loader, desc="Testing"):
+                for task_data in batch:
+                    _, pred_pH, true_pH = self.process_task(task_data, train=False)
+                    predictions.append({
+                        'opt_id': task_data['opt_id'],
+                        'true_pH': true_pH,
+                        'predicted_pH': pred_pH
+                    })
+                    true_pHs.append(true_pH)
+                    predicted_pHs.append(pred_pH)
         
         metrics = calculate_metrics(true_pHs, predicted_pHs)
         print_metrics(metrics)

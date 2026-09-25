@@ -1,0 +1,21 @@
+{
+  "seeds": [0, 1, 2, 3, 42],
+  "pretrained_task_head": false,
+  "dataset": "phopt",
+  "retrieval_strategy": "opt_retrieval",
+  "topk": 5,
+  "meta_lr": 1.0,
+  "inner_lr": 0.001,
+  "num_epochs": 50,
+  "meta_batch_size": 5,
+  "support_batch_size": 1,
+  "inner_steps": 5,
+  "validate_every": 200,
+  "patience": 5,
+  "min_delta": 0.0001,
+  "eval_batch_size": 10,
+  "embedding_memory_cache_size": 128,
+  "num_workers": 0,
+  "threads": 2,
+  "selection": "minimum original-validation unweighted MSE with existing patience/min_delta"
+}

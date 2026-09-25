@@ -1,0 +1,26 @@
+{
+  "upstream": "/home/hetianci/projects/pHoptNN",
+  "commit": "137effbe66693a9b8233ee8eb522c4e282c9ae2d",
+  "files": {
+    "gcl.py": {
+      "source": "EGNN/models/gcl.py",
+      "source_sha256": "05c956dab2c8d4a7e3d7297aa0325629f1077cb8d1d2b1074206f98497a97575",
+      "import_namespace_patch": false
+    },
+    "model.py": {
+      "source": "EGNN/models/egnn.py",
+      "source_sha256": "722cc9be8dc173a97c5eb0bdd62f5c6d90ab0ecb2fe96a0bd50a29e34edc47dd",
+      "import_namespace_patch": true
+    },
+    "constants.py": {
+      "source": "EGNN/constants.py",
+      "source_sha256": "80506cc85d9cae8658ca7ca25dadf985dae697775f12c059c636bfecb423ddb0",
+      "import_namespace_patch": false
+    },
+    "LICENSE": {
+      "source": "LICENSE",
+      "source_sha256": "aab77e9a7fe63e685931749a2fb9542db8a1889f2bc7ca40c592fb41f423eb40",
+      "import_namespace_patch": false
+    }
+  }
+}

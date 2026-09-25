@@ -1,4 +1,5 @@
 import sys
+import warnings
 
 import torch
 from torch import nn
@@ -18,6 +19,9 @@ class pHPredictionModel(nn.Module):
                  embedding_memory_cache_size=256, device=None,
                  use_data_parallel=True):
         super(pHPredictionModel, self).__init__()
+        # EpHod's RLAT constructors reseed PyTorch from their saved configuration.
+        # Capture the caller's seed before loading them for a genuinely fresh head.
+        self.initialization_seed = None if pretrained else torch.initial_seed()
         self.ephod_model = models.EpHodModel(
             device=device,
             use_data_parallel=use_data_parallel,
@@ -28,9 +32,16 @@ class pHPredictionModel(nn.Module):
         )
         
         self._set_parameter_requires_grad()
+        self._legacy_task_head_buffers = {
+            self._canonical_parameter_name(name): value.detach().cpu().clone()
+            for name, value in self._task_head_buffers().items()
+        }
         
         if not pretrained:
             self._initialize_trainable_params()
+            for module in self.ephod_model.rlat_model.modules():
+                if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                    module.reset_running_stats()
         
         self.train()
 
@@ -46,12 +57,14 @@ class pHPredictionModel(nn.Module):
             param.requires_grad = 'rlat_model' in name
 
     def _initialize_trainable_params(self):
-        for param in self.ephod_model.parameters():
-            if param.requires_grad:
-                if param.dim() > 1:
-                    nn.init.xavier_uniform_(param)
-                else:
-                    nn.init.uniform_(param, -0.1, 0.1)
+        with torch.random.fork_rng():
+            torch.manual_seed(self.initialization_seed)
+            for param in self.ephod_model.parameters():
+                if param.requires_grad:
+                    if param.dim() > 1:
+                        nn.init.xavier_uniform_(param)
+                    else:
+                        nn.init.uniform_(param, -0.1, 0.1)
 
     def _set_batchnorm_to_eval(self):
         for module in self.ephod_model.modules():
@@ -62,10 +75,22 @@ class pHPredictionModel(nn.Module):
         return [p for p in self.parameters() if p.requires_grad]
 
     def trainable_state_dict(self):
-        return {
+        """Save the task head, including buffers needed to reproduce inference."""
+        state = {
             name: param.detach().to(device='cpu').clone()
             for name, param in self.named_parameters()
             if param.requires_grad
+        }
+        state.update({
+            name: value.detach().cpu().clone()
+            for name, value in self._task_head_buffers().items()
+        })
+        return state
+
+    def _task_head_buffers(self):
+        return {
+            name: value for name, value in self.named_buffers()
+            if name.startswith('ephod_model.rlat_model.')
         }
 
     def load_trainable_state_dict(self, state):
@@ -73,10 +98,38 @@ class pHPredictionModel(nn.Module):
             self._canonical_parameter_name(name): value
             for name, value in state.items()
         }
+        parameters = {
+            self._canonical_parameter_name(name): param
+            for name, param in self.named_parameters() if param.requires_grad
+        }
+        buffers = {
+            self._canonical_parameter_name(name): value
+            for name, value in self._task_head_buffers().items()
+        }
+        present_buffers = buffers.keys() & canonical_state.keys()
+        if present_buffers and present_buffers != buffers.keys():
+            raise ValueError('Incomplete task-head buffer state in checkpoint.')
+        legacy = bool(buffers) and not present_buffers
+        if legacy:
+            # Old lightweight checkpoints omitted buffers, even for fresh runs.
+            # Their predictions used the original supervised EpHod statistics.
+            canonical_state.update(self._legacy_task_head_buffers)
+        destinations = {**parameters, **buffers}
+        if destinations.keys() != canonical_state.keys():
+            raise ValueError('Task-head checkpoint keys do not match the model.')
+        for name, value in destinations.items():
+            if value.shape != canonical_state[name].shape:
+                raise ValueError(f'Task-head checkpoint shape mismatch: {name}')
+        if legacy:
+            warnings.warn(
+                'Loading a legacy parameter-only checkpoint with original EpHod '
+                'BatchNorm statistics. This uses supervised task state and is not '
+                'PHOPT-only; the original EpHod checkpoint must be unchanged.',
+                UserWarning, stacklevel=2,
+            )
         with torch.no_grad():
-            for name, param in self.named_parameters():
-                if param.requires_grad:
-                    param.copy_(canonical_state[self._canonical_parameter_name(name)])
+            for name, value in destinations.items():
+                value.copy_(canonical_state[name])
 
     def load_compatible_state_dict(self, state):
         canonical_state = {

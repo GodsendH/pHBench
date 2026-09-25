@@ -1,33 +1,113 @@
 {
-  "audit": {
-    "passed": true,
-    "violation_count_capped": 0,
-    "violations": []
-  },
-  "cluster_count": 3917,
-  "cluster_mode": "all_vs_all_search_connected_component",
+  "protocol": "fixed_test_removal_v3",
+  "name": "identity30",
   "counts": {
-    "test": 1963,
-    "train": 6936,
-    "validation": 846
+    "train": {
+      "count": 3800,
+      "unique_sequences": 3780,
+      "ph_bins": {
+        "1": 2,
+        "10": 26,
+        "11": 2,
+        "12": 2,
+        "2": 12,
+        "3": 25,
+        "4": 95,
+        "5": 215,
+        "6": 539,
+        "7": 1928,
+        "8": 813,
+        "9": 141
+      },
+      "ec_classes": {
+        "3": 1270,
+        "1": 747,
+        "4": 378,
+        "6": 153,
+        "2": 1045,
+        "7": 60,
+        "5": 147
+      },
+      "min_length": 33,
+      "max_length": 1021
+    },
+    "validation": {
+      "count": 411,
+      "unique_sequences": 408,
+      "ph_bins": {
+        "10": 4,
+        "11": 2,
+        "3": 1,
+        "4": 8,
+        "5": 22,
+        "6": 50,
+        "7": 205,
+        "8": 101,
+        "9": 18
+      },
+      "ec_classes": {
+        "3": 135,
+        "2": 108,
+        "1": 69,
+        "4": 48,
+        "5": 16,
+        "6": 23,
+        "7": 12
+      },
+      "min_length": 38,
+      "max_length": 1017
+    },
+    "test": {
+      "count": 1971,
+      "unique_sequences": 1969,
+      "ph_bins": {
+        "1": 2,
+        "10": 17,
+        "11": 4,
+        "12": 1,
+        "2": 4,
+        "3": 11,
+        "4": 50,
+        "5": 151,
+        "6": 290,
+        "7": 904,
+        "8": 434,
+        "9": 103
+      },
+      "ec_classes": {
+        "4": 182,
+        "3": 680,
+        "6": 54,
+        "1": 420,
+        "2": 513,
+        "5": 100,
+        "7": 22
+      },
+      "min_length": 47,
+      "max_length": 1012
+    }
   },
+  "file_hashes": {
+    "train": "8a30134d669a5777c21ea3a32d578ee7d3a9e7188f489c1f08d59c0eb66db7ba",
+    "validation": "97351b719746ce30caf53f74fbb024e326e87b75f1d4bf9d414f1fd208efdbb6",
+    "test": "ce370ce7e28bb980c54d95b0e047353161b14d372ec56ad66c66ad20d8e0b6db"
+  },
+  "audit_directory": "/home/hetianci/projects/Venus-DREAM/data/dataset_audits/fixed_test_removal_v3",
   "coverage": 0.8,
-  "coverage_mode": 0,
-  "dataset": "identity30",
-  "identity": 0.3,
-  "identity_percent": 30.0,
-  "label_conflict_threshold": 0.25,
-  "largest_cluster": 81,
-  "mmseqs_version": "18.8cc5c",
-  "removed_conflict_groups": 29,
-  "search_sensitivity": 7.5,
-  "seed": 42,
-  "split_attempts": 32,
-  "split_objective": 5.349377882522827,
-  "target_ratios": {
-    "test": 0.2,
-    "train": 0.723,
-    "validation": 0.077
+  "identity_threshold": 0.3,
+  "validation_threshold": 0.3,
+  "random_reference": null,
+  "removal_counts": {
+    "train": 3324,
+    "validation": 349
   },
-  "total_records": 9745
+  "source_hashes": {
+    "train": "b003e197e1fd3df782580022324b07ce2ce07cee543fdc643ea85a238490b769",
+    "validation": "eac6456159826fcbc5fd1d5ebdaf6086eb47cb30d6214d218ae97ea107003bb3",
+    "test": "ce370ce7e28bb980c54d95b0e047353161b14d372ec56ad66c66ad20d8e0b6db"
+  },
+  "input_policy": "all official records retained before similarity removal; no deduplication, label conflict removal, aggregation or reweighting",
+  "sample_weight_policy": "official weights preserved; provenance not reestimated",
+  "search_limitations": "Union of two-direction sensitive and forward no-prefilter local alignments, E-value<=100. Not proof of absence of remote homology.",
+  "nearest_neighbor_policy": "Maximum identity among emitted alignments, not maximum over all possible alignments; blank means no detected qualifying hit."
 }

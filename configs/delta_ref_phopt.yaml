@@ -1,0 +1,46 @@
+paths:
+  manifest: artifacts/phgeofuse/manifest.csv
+  folds: experiments/phgeofuse_redesign_20260914/homology_oof/strict_folds.json
+  esm1v: experiments/phgeofuse_redesign_20260914/esm1v_masked/features.npz
+  esm2: experiments/phgeofuse_redesign_20260914/esm2_masked/features.npz
+  source_experiment: experiments/phgeofuse_redesign_20260914
+  baseline_experiment: experiments/phgeofuse_phopt_full_20260913
+  output: experiments/delta_ref_phopt_20260916
+protocol:
+  expected_counts: {train: 7124, validation: 760, test: 1971}
+  seeds: [0, 1, 2, 3, 42]
+  development_seed: 42
+  bootstrap_draws: 10000
+  acid_max: 4.0
+  alkaline_min: 10.0
+  global_tolerance: 0.01
+  core_tolerance: 0.01
+  false_extreme_tolerance: 0.005
+model:
+  widths: [64, 128]
+  frequency_powers: [0.0, 0.5]
+  dropout: 0.1
+  references_per_bin: 8
+training:
+  device: cuda
+  threads: 4
+  batch_size: 512
+  learning_rate: 0.0003
+  weight_decay: 0.001
+  max_epochs: 60
+  patience: 8
+  pairs_per_query: 8
+  natural_partners: 4
+  gradient_clip: 1.0
+lora:
+  model: facebook/esm2_t33_650M_UR50D
+  last_layers: 4
+  rank: 8
+  alpha: 16
+  dropout: 0.05
+  learning_rate: 0.00001
+  chunk_length: 1022
+  accumulation_steps: 16
+  micro_batch_pairs: 1
+  max_epochs: 60
+  patience: 8

@@ -205,6 +205,7 @@ def train_model(
     loaders, train_sampler = build_loaders(records, retrieval, config, context)
     if len(loaders["train"].dataset) == 0 or len(loaders["validation"].dataset) == 0:
         raise ValueError("training and validation splits must both contain ready proteins")
+    _configure_regression_weight_normalizer(loaders["train"].dataset.records, config)
 
     model = PHGeoFuse(config, context.device).to(context.device)
     if init_checkpoint:
@@ -249,7 +250,12 @@ def train_model(
     if min_delta < 0:
         raise ValueError("training.early_stopping_min_delta must be non-negative")
     clip = float(get(config, "training.gradient_clip", 1.0))
-    for epoch in range(start_epoch, epochs):
+    # Fixed-epoch refits may preserve the original scheduler horizon while
+    # stopping at an epoch selected entirely within development data.
+    stop_after = int(get(config, "training.stop_after_epochs", epochs))
+    if not 1 <= stop_after <= epochs:
+        raise ValueError("training.stop_after_epochs must be within [1, epochs]")
+    for epoch in range(start_epoch, stop_after):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         _set_training_mode(model, config)
@@ -366,6 +372,28 @@ def train_model(
             break
     context.barrier()
     return run_dir / "best.pt"
+
+
+def _configure_regression_weight_normalizer(training_records, config):
+    """Fit the fixed MSE denominator using exactly the loader's training rows."""
+    if str(get(config, "loss.mse_weighting", "none")) != "sample_global":
+        return
+    if not training_records or any(r.split != "train" or r.status != "ready" for r in training_records):
+        raise ValueError("MSE normalization requires nonempty ready training records only")
+    weights = np.asarray([r.sample_weight for r in training_records], dtype=np.float64)
+    if not np.isfinite(weights).all() or (weights <= 0).any():
+        raise ValueError("training MSE weights must be finite and positive")
+    lower = float(get(config, "loss.mse_min_sample_weight", 0.0))
+    upper = float(get(config, "loss.mse_max_sample_weight", math.inf))
+    if not math.isfinite(lower) or lower < 0 or math.isnan(upper) or upper <= 0 or upper < lower:
+        raise ValueError("invalid MSE sample weight bounds")
+    mean = float(np.clip(weights, lower, upper).mean())
+    previous = get(config, "loss.mse_training_weight_mean")
+    if previous is not None and not math.isclose(float(previous), mean, rel_tol=1e-7, abs_tol=1e-12):
+        raise ValueError("saved MSE normalizer differs from current training weights")
+    loss = config.setdefault("loss", {})
+    loss["mse_training_weight_mean"] = mean
+    loss["mse_training_weight_rows"] = len(training_records)
 
 
 def evaluate_loader(model, loader, config, context, include_loss: bool = False):

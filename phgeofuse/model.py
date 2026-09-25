@@ -386,6 +386,38 @@ class PHGeoFuse(nn.Module):
         }
 
 
+def _regression_objective(errors: torch.Tensor, batch: dict[str, Any], config: dict[str, Any]):
+    """Keep the historical objective by default; opt in to fold-fitted weights.
+
+    MSE clipping is separate from the existing distribution-loss clipping so
+    that a weighting ablation does not silently change the auxiliary loss.
+    The caller is responsible for fitting weights on its training subset.
+    ``sample`` preserves the initial batch-normalized ablation. Prefer
+    ``sample_global`` for stochastic training: a fixed training-set mean
+    prevents weights cancelling in singleton batches or changing with batch
+    composition. The engine fits that normalizer on ready training records.
+    """
+    mode = str(get(config, "loss.mse_weighting", "none"))
+    if mode == "none":
+        return errors.mean()
+    if mode not in {"sample", "sample_global"}:
+        raise ValueError("loss.mse_weighting must be 'none', 'sample' or 'sample_global'")
+    weights = batch["weights"].to(errors)
+    if weights.shape != errors.shape or not bool(torch.isfinite(weights).all()) or bool((weights <= 0).any()):
+        raise ValueError("MSE sample weights must be finite, positive and aligned")
+    lower = float(get(config, "loss.mse_min_sample_weight", 0.0))
+    upper = float(get(config, "loss.mse_max_sample_weight", math.inf))
+    if not math.isfinite(lower) or lower < 0 or math.isnan(upper) or upper <= 0 or upper < lower:
+        raise ValueError("invalid MSE sample weight bounds")
+    weights = weights.clamp(lower, upper)
+    if mode == "sample_global":
+        normalizer = float(get(config, "loss.mse_training_weight_mean", math.nan))
+        if not math.isfinite(normalizer) or normalizer <= 0:
+            raise ValueError("sample_global requires a positive training-fitted mse_training_weight_mean")
+        return (weights * errors).mean() / normalizer
+    return (weights * errors).sum() / weights.sum()
+
+
 def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, Any], config: dict[str, Any]):
     labels = batch["labels"]
     grid = torch.arange(
@@ -403,8 +435,9 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, Any], config
         float(get(config, "loss.min_sample_weight", 0.5)), float(get(config, "loss.max_sample_weight", 3.0))
     )
     weighted_distribution = (weights * distribution_loss).sum() / weights.sum().clamp_min(1e-8)
+    objective_mse = _regression_objective(mse_loss, batch, config)
     primary = (
-        float(get(config, "loss.mse_weight", 1.0)) * mse_loss.mean()
+        float(get(config, "loss.mse_weight", 1.0)) * objective_mse
         + float(get(config, "loss.distribution_weight", 0.2)) * weighted_distribution
     )
     valid_ec = batch["ec_labels"] >= 0
@@ -417,6 +450,8 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, Any], config
         "distribution": weighted_distribution.detach(),
         "ec": ec_loss.detach(),
     }
+    if str(get(config, "loss.mse_weighting", "none")) != "none":
+        components["objective_mse"] = objective_mse.detach()
     gate_loss, gate_components = _gate_regularization(outputs, labels, config)
     total = total + gate_loss
     components.update(gate_components)
@@ -429,10 +464,14 @@ def compute_low_homology_loss(
     config: dict[str, Any],
 ):
     labels = batch["labels"]
-    mse = F.mse_loss(outputs["mean"], labels)
+    errors = F.mse_loss(outputs["mean"], labels, reduction="none")
+    mse = _regression_objective(errors, batch, config)
     gate_loss, gate_components = _gate_regularization(outputs, labels, config)
     total = float(get(config, "loss.mse_weight", 1.0)) * mse + gate_loss
-    return total, {"mse": mse.detach(), **gate_components}
+    components = {"mse": errors.mean().detach(), **gate_components}
+    if str(get(config, "loss.mse_weighting", "none")) != "none":
+        components["objective_mse"] = mse.detach()
+    return total, components
 
 
 def compute_dual_view_loss(

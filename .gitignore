@@ -1,4 +1,53 @@
+# Python caches and local tooling
 __pycache__/
 *.py[cod]
+*.pyo
 .pytest_cache/
-artifacts/phgeofuse/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+.ipynb_checkpoints/
+
+# Local environments and secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Training outputs, checkpoints, experiment runs and logs
+artifacts/
+experiments/
+logs/
+tmp/
+saved_models/
+checkpoints/
+runs/
+wandb/
+tensorboard/
+
+# Generated model/data caches (recreated by preparation scripts)
+data/features/
+data/processed/
+data/dataset_audits/
+data/dataset_backups/
+data/processed/
+
+# Generated dataset indexes and selection reports
+data/datasets/*/clusters.tsv
+data/datasets/*/duplicate_conflicts.tsv
+data/datasets/*/selection.tsv
+data/datasets/*/test_nearest_neighbors.tsv
+
+# Local papers, extracted text and other analysis artifacts
+*.pdf
+pdf_text*.txt
+
+# Generated reports and dated analysis folders
+docs/*/
+
+# Large optional benchmark exports
+data/datasets/fixedtest_*/
+data/pHenv_data.csv
+._*

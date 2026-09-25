@@ -195,6 +195,26 @@ Distributed Reptile run names also include global meta-batch size and world
 size. Use `--checkpoint_path` to test a checkpoint with a different number of
 GPUs from the training run.
 
+Fresh runs without `--pretrained` reset both RLAT parameters and BatchNorm
+running statistics. The head initialization uses the caller's PyTorch seed;
+EpHod's internal checkpoint seed does not replace it. ESM1v remains pretrained
+and frozen. BatchNorm remains in evaluation mode during meta-learning.
+
+Lightweight checkpoints contain the task-head parameters and its inference
+buffers, but omit ESM1v. Legacy parameter-only checkpoints restore the original
+EpHod BatchNorm statistics with a warning; reproducing these requires the same
+EpHod checkpoint used for training. Even legacy runs without `--pretrained`
+inherited these supervised statistics and must not be described as PHOPT-only.
+Existing experiment scores are not changed by this initialization fix.
+
+Validation and testing disable dropout while retaining the gradients needed
+for support adaptation. Supports use a fixed order during evaluation, and
+parameters, buffers, module modes and random states are restored afterwards,
+including on exceptions. MAML validation averages over query samples; both
+trainers restore the best validation checkpoint when training finishes.
+These evaluation fixes require new scores; historical result files retain
+their original evaluation conditions.
+
 
 ### Command Line Arguments
 
@@ -221,7 +241,7 @@ GPUs from the training run.
   - `--num_workers`: Data loader worker count per process
   - `--distributed_backend`: Distributed backend, normally `nccl`
   - `--checkpoint_path`: Explicit checkpoint path for test mode
-  - `--seed`: Random seed for task and support-set shuffling
+  - `--seed`: Random seed for task/support shuffling and fresh task-head initialization
   - `--embedding_cache_dir`: Directory for persistent float32 ESM1v embeddings
   - `--embedding_memory_cache_size`: Maximum number of CPU embeddings kept in memory
   - `--disable_embedding_cache`: Disable persistent and in-memory embedding reuse

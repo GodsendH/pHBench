@@ -15,6 +15,7 @@ import torch
 
 from .cache import atomic_json, atomic_text, sha256_file
 from .config import get
+from .confidence import CONFIDENCE_VERSION, normalize_pdb_confidence
 
 
 AA3_TO_1 = {
@@ -149,6 +150,8 @@ def download_alphafold_structure(
             chain, residues = select_chain(destination, sequence)
             return {
                 "source": "alphafold_db",
+                "plddt_scale": "0_100",
+                "confidence_version": CONFIDENCE_VERSION,
                 "url": pdb_url,
                 "chain": chain,
                 "mean_plddt": sum(item.plddt for item in residues) / len(residues),
@@ -194,16 +197,25 @@ def predict_esmfold_structure(
     model.esm = model.esm.half()
     model.trunk.set_chunk_size(int(get(config, "structure.esmfold_chunk_size", 64)))
     model = model.cuda().eval()
-    tokens = tokenizer([sequence], add_special_tokens=False, return_tensors="pt")["input_ids"].cuda()
+    # ESMFold omits atoms for X; keep residue positions using an explicit surrogate.
+    folding_sequence = sequence.replace("X", "A")
+    tokens = tokenizer([folding_sequence], add_special_tokens=False, return_tensors="pt")["input_ids"].cuda()
     try:
         with torch.inference_mode():
             output = model(tokens)
         pdb = model.output_to_pdb(output)[0]
+        # Hugging Face ESMFold exports categorical_lddt in [0, 1].
+        pdb = normalize_pdb_confidence(pdb, "0_1")
+        pdb = mask_unknown_residue_confidence(pdb, sequence)
         atomic_text(destination, pdb)
         chain, residues = select_chain(destination, sequence)
         return {
             "source": "esmfold",
+            "plddt_scale": "0_100",
+            "confidence_version": CONFIDENCE_VERSION,
             "model": repo,
+            "folding_sequence": folding_sequence,
+            "unknown_residue_policy": "X_to_A_for_folding_only_zero_confidence",
             "chain": chain,
             "mean_plddt": sum(item.plddt for item in residues) / len(residues),
             "structure_sha256": sha256_file(destination),
@@ -212,6 +224,17 @@ def predict_esmfold_structure(
     finally:
         del model
         torch.cuda.empty_cache()
+
+
+def mask_unknown_residue_confidence(pdb: str, sequence: str) -> str:
+    lines = []
+    for line in pdb.splitlines(keepends=True):
+        if line.startswith("ATOM"):
+            index = int(line[22:26]) - 1
+            if 0 <= index < len(sequence) and sequence[index] == "X":
+                line = line[:60] + "  0.00" + line[66:]
+        lines.append(line)
+    return "".join(lines)
 
 
 def acquire_structure(

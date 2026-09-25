@@ -9,6 +9,9 @@ DATASET_CHOICES = (
     "identity50",
     "identity30",
     "identity20",
+    "fixedtest_control",
+    *(f"fixedtest_random{identity}_seed{seed}"
+      for identity in (100, 50, 30, 20) for seed in range(5)),
 )
 
 _ALIASES = {

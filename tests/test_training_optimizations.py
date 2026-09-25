@@ -146,7 +146,7 @@ class TrainingOptimizationTests(unittest.TestCase):
                 reloaded(['other-id'], ['ACD'])
                 self.assertEqual(reloaded.ephod_model.encode_calls, 0)
 
-    def test_checkpoint_contains_only_trainable_parameters(self):
+    def test_checkpoint_contains_only_task_head_state(self):
         with tempfile.TemporaryDirectory() as cache_dir:
             with mock.patch.object(base_model.models, 'EpHodModel', FakeEpHodModel):
                 model = base_model.pHPredictionModel(
@@ -172,6 +172,9 @@ class TrainingOptimizationTests(unittest.TestCase):
                 self.assertTrue(
                     all('rlat_model' in name for name in checkpoint['model_state_dict'])
                 )
+                self.assertTrue(any(
+                    name.endswith('running_mean') for name in checkpoint['model_state_dict']
+                ))
 
                 trainable_state = model.trainable_state_dict()
                 data_parallel_state = {
