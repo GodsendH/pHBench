@@ -273,6 +273,9 @@ Venus-DREAM entry points. It combines cached SaProt-650M residue embeddings, a
 residue EGNN, pH-conditioned ionization features, and homology-aware SaProt and
 Foldseek retrieval. The original MAML/Reptile workflow remains unchanged.
 
+The PHOPT graph architecture comparison and the main-model recommendation are
+documented in [`docs/phopt_gnn_architecture_research.md`](docs/phopt_gnn_architecture_research.md).
+
 Upgrade the existing environment without replacing its PyTorch/CUDA stack:
 
 ```bash

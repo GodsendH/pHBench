@@ -40,14 +40,14 @@ graph:
 
 model:
   mode: frozen
-  # Set to hybrid for the edge-aware EGNN/graph-attention encoder in
-  # configs/phgeofuse_phopt_hybrid.yaml. Keep egnn for historical checkpoints.
-  graph_encoder: egnn
+  graph_encoder: hybrid
   saprot_model: westlake-repl/SaProt_650M_AF2
   saprot_revision: d9b9ad00ef61c0990e611b2b43f2231c7de24b38
   embedding_dim: 1280
   hidden_dim: 256
-  egnn_layers: 6
+  egnn_layers: 4
+  graph_attention_heads: 4
+  local_ph_conditioning: true
   attention_heads: 4
   dropout: 0.1
   ph_min: 2.0
@@ -77,7 +77,7 @@ loss:
   max_sample_weight: 3.0
 
 training:
-  run_name: phgeofuse_phopt_mse
+  run_name: phgeofuse_phopt_hybrid
   seed: 42
   per_device_batch_size: 2
   global_batch_size: 32

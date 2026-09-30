@@ -14,7 +14,7 @@ from phgeofuse.config import load_config
 from phgeofuse.dataset import ProteinGraphDataset
 from phgeofuse.graph import build_edges, graph_feature_dim
 from phgeofuse.io import ProteinRecord, parse_phopt_header, read_fasta, read_manifest
-from phgeofuse.model import PHGeoFuse, compute_dual_view_loss, compute_loss
+from phgeofuse.model import PHGeoFuse, compute_dual_view_loss, compute_loss, scatter_softmax
 from phgeofuse.retrieval import (
     RETRIEVAL_FEATURE_DIM,
     RetrievalStore,
@@ -406,6 +406,205 @@ class PHGeoFuseTests(unittest.TestCase):
         loss.backward()
         self.assertTrue(any(parameter.grad is not None for parameter in model.parameters()))
         self.assertIn("ec", parts)
+
+    def test_hybrid_graph_encoder_forward_and_backward(self):
+        config = _tiny_config()
+        config["model"].update({"graph_encoder": "hybrid", "graph_attention_heads": 2})
+        model = PHGeoFuse(config, torch.device("cpu"))
+        batch = _tiny_batch()
+        outputs = model(batch)
+        loss, _ = compute_loss(outputs, batch, config)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        attention_parameters = [
+            parameter for name, parameter in model.named_parameters() if "attention_layers" in name
+        ]
+        self.assertTrue(attention_parameters)
+        self.assertTrue(any(parameter.grad is not None for parameter in attention_parameters))
+
+    def test_local_ph_conditioning_forward_and_backward(self):
+        config = _tiny_config()
+        config["model"]["local_ph_conditioning"] = True
+        model = PHGeoFuse(config, torch.device("cpu"))
+        batch = _tiny_batch()
+        outputs = model(batch)
+        self.assertEqual(outputs["probabilities"].shape, (2, 5))
+        loss, _ = compute_loss(outputs, batch, config)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+
+    def test_mean_skip_defaults_to_absent(self):
+        config = _tiny_config()
+        model = PHGeoFuse(config, torch.device("cpu"))
+        self.assertIsNone(model.mean_skip)
+        self.assertFalse(
+            any(name.startswith("mean_skip.") for name in model.state_dict())
+        )
+
+    def test_zero_initialized_mean_skip_preserves_expert_zero(self):
+        source_config = _tiny_config()
+        source_model = PHGeoFuse(source_config, torch.device("cpu"))
+        target_config = copy.deepcopy(source_config)
+        target_config["model"]["mean_skip"] = True
+        target_model = PHGeoFuse(target_config, torch.device("cpu"))
+        incompatible = target_model.load_state_dict(
+            source_model.state_dict(), strict=False
+        )
+        self.assertTrue(incompatible.missing_keys)
+        self.assertTrue(
+            all(name.startswith("mean_skip.") for name in incompatible.missing_keys)
+        )
+        self.assertFalse(incompatible.unexpected_keys)
+        source_model.eval()
+        target_model.eval()
+        batch = _tiny_batch()
+
+        source = source_model(batch)
+        target = target_model(batch)
+
+        torch.testing.assert_close(target["mean"], source["mean"], rtol=0, atol=0)
+        torch.testing.assert_close(
+            target["expert_means"][:, 0], source["expert_means"][:, 0], rtol=0, atol=0
+        )
+
+    def test_pooled_summary_is_l2_normalized_mean_and_std(self):
+        model = PHGeoFuse(_tiny_config(), torch.device("cpu"))
+        batch = _tiny_batch()
+        embeddings = batch["embeddings"].float()
+        summary = model._pooled_summary(
+            embeddings, batch["graph_index"], len(batch["lengths"])
+        )
+        half = embeddings.shape[1]
+        self.assertEqual(summary.shape, (2, 2 * half))
+        per_protein = [
+            embeddings[batch["graph_index"] == protein] for protein in range(2)
+        ]
+        for start, statistic in (
+            (0, lambda rows: rows.mean(dim=0)),
+            (half, lambda rows: rows.std(dim=0, unbiased=False)),
+        ):
+            expected = torch.stack([statistic(rows) for rows in per_protein])
+            expected = expected / expected.norm(dim=-1, keepdim=True)
+            torch.testing.assert_close(
+                summary[:, start:start + half], expected, rtol=1e-5, atol=1e-6
+            )
+
+    def test_mean_skip_shifts_expert_zero_by_the_pooled_summary(self):
+        config = _tiny_config()
+        config["model"]["mean_skip"] = True
+        model = PHGeoFuse(config, torch.device("cpu"))
+        model.eval()
+        batch = _tiny_batch()
+        summary = model._pooled_summary(
+            batch["embeddings"].float(), batch["graph_index"], len(batch["lengths"])
+        )
+        with torch.no_grad():
+            baseline = model(batch)["expert_means"][:, 0]
+            model.mean_skip.weight.fill_(1.0)
+            model.mean_skip.bias.zero_()
+            shifted = model(batch)["expert_means"][:, 0]
+        torch.testing.assert_close(
+            shifted - baseline, summary.sum(dim=-1), rtol=1e-5, atol=1e-6
+        )
+
+    def test_mean_skip_receives_gradient_with_disabled_structural_features(self):
+        config = _tiny_config()
+        config["model"]["mean_skip"] = True
+        config["ablation"] = {"disable_structural_features": True}
+        model = PHGeoFuse(config, torch.device("cpu"))
+        batch = _tiny_batch()
+        outputs = model(batch)
+        loss, _ = compute_loss(outputs, batch, config)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertIsNotNone(model.mean_skip.weight.grad)
+        self.assertTrue(torch.isfinite(model.mean_skip.weight.grad).all())
+
+    def test_frozen_linear_expert_replaces_expert_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = _tiny_config()
+            config["model"]["frozen_linear_expert"] = _write_frozen_expert(directory)
+            model = PHGeoFuse(config, torch.device("cpu"))
+            model.eval()
+            batch = _tiny_batch()
+            plain = PHGeoFuse(_tiny_config(), torch.device("cpu"))
+            plain.eval()
+            summary = model._pooled_summary(
+                batch["embeddings"].float(), batch["graph_index"], len(batch["lengths"])
+            )
+            weight, bias = model.mean_skip.weight[0], model.mean_skip.bias[0]
+
+            with torch.no_grad():
+                expert_zero = model(batch)["expert_means"][:, 0]
+                decoder_mean = plain(batch)["expert_means"][:, 0]
+
+        self.assertTrue(model.mean_skip_replaces)
+        # Equal to the linear map alone, not to the map added on top of the
+        # decoder mean -- that is what makes this a replacement.
+        torch.testing.assert_close(
+            expert_zero, summary @ weight + bias, rtol=1e-5, atol=1e-6
+        )
+        self.assertFalse(
+            torch.allclose(expert_zero, decoder_mean + summary @ weight + bias, atol=1e-3)
+        )
+
+    def test_frozen_linear_expert_is_frozen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = _tiny_config()
+            config["model"]["frozen_linear_expert"] = _write_frozen_expert(directory)
+            model = PHGeoFuse(config, torch.device("cpu"))
+            self.assertFalse(model.mean_skip.weight.requires_grad)
+            self.assertFalse(model.mean_skip.bias.requires_grad)
+            batch = _tiny_batch()
+            loss, _ = compute_loss(model(batch), batch, config)
+            self.assertTrue(torch.isfinite(loss))
+            loss.backward()
+            self.assertIsNone(model.mean_skip.weight.grad)
+            self.assertIsNone(model.mean_skip.bias.grad)
+
+    def test_frozen_linear_expert_rejects_a_bad_payload(self):
+        cases = {
+            "pooling": "mean-l2",
+            "feature_dim": 4,
+            "fitted_on": "validation",
+        }
+        for key, value in cases.items():
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                config = _tiny_config()
+                config["model"]["frozen_linear_expert"] = _write_frozen_expert(
+                    directory, **{key: value}
+                )
+                with self.assertRaises(ValueError):
+                    PHGeoFuse(config, torch.device("cpu"))
+
+    def test_frozen_linear_expert_checks_the_dataset_fingerprint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_frozen_expert(directory)
+            matching = _tiny_config()
+            matching["model"]["frozen_linear_expert"] = path
+            matching["data"] = {"dataset_fingerprint": "fingerprint-a"}
+            self.assertTrue(PHGeoFuse(matching, torch.device("cpu")).mean_skip_replaces)
+
+            foreign = _tiny_config()
+            foreign["model"]["frozen_linear_expert"] = path
+            foreign["data"] = {"dataset_fingerprint": "fingerprint-b"}
+            with self.assertRaises(ValueError):
+                PHGeoFuse(foreign, torch.device("cpu"))
+
+    def test_mean_skip_and_frozen_expert_are_mutually_exclusive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = _tiny_config()
+            config["model"]["mean_skip"] = True
+            config["model"]["frozen_linear_expert"] = _write_frozen_expert(directory)
+            with self.assertRaises(ValueError):
+                PHGeoFuse(config, torch.device("cpu"))
+
+    def test_scatter_softmax_normalizes_incoming_edges(self):
+        logits = torch.tensor([[1.0, 2.0], [2.0, 1.0], [0.0, 0.0]])
+        index = torch.tensor([0, 0, 1])
+        weights = scatter_softmax(logits, index, size=2)
+        torch.testing.assert_close(weights[:2].sum(dim=0), torch.ones(2))
+        torch.testing.assert_close(weights[2], torch.ones(2))
 
     def test_fixed_fusion_renormalizes_unavailable_experts(self):
         config = _tiny_config()
@@ -1104,6 +1303,23 @@ def _tiny_config():
             "ec_weight": 0.1,
         },
     }
+
+
+def _write_frozen_expert(directory, **overrides):
+    """Write a minimal frozen-linear-expert payload shaped for _tiny_config."""
+    payload = {
+        "weight": (torch.arange(8, dtype=torch.float32) / 4.0).reshape(1, 8),
+        "bias": torch.tensor([0.25]),
+        "alpha": 0.03,
+        "feature_dim": 8,
+        "pooling": "mean+std-l2",
+        "fitted_on": "train",
+        "dataset_fingerprint": "fingerprint-a",
+    }
+    payload.update(overrides)
+    destination = Path(directory) / "linear_expert.pt"
+    torch.save(payload, destination)
+    return str(destination)
 
 
 def _pdb_ca_line(serial: int, residue: str, number: int, x: float) -> str:
