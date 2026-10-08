@@ -1,0 +1,51 @@
+# Full Dual recipe with an independently fitted PHGeoFuse-Lite baseline.
+paths:
+  manifest: experiments/dual_phoptnn_20260924/manifest.csv
+  retrieval: experiments/dual_phoptnn_20260924/retrieval.pt
+  dual_lite_run: artifacts/dual_lite/phopt_v1
+  corrected_dual: experiments/dual_phoptnn_20260924/dual_refit
+  historical_dual: experiments/phgeofuse_redesign_20260914/dual_candidate_float64
+  historical_test: experiments/phgeofuse_redesign_20260914/dual_test/seed42.csv
+  folds: experiments/phgeofuse_redesign_20260914/homology_oof/strict_folds.json
+  evaluation_clusters: experiments/dual_phoptnn_20260924/evaluation_clusters_cluster.tsv
+  esm1v_features: experiments/phgeofuse_redesign_20260914/esm1v_masked/features.npz
+  esm2_features: experiments/phgeofuse_redesign_20260914/esm2_masked/features.npz
+  esm1v_test_features: experiments/phgeofuse_redesign_20260914/esm1v_masked/features_test.npz
+  esm2_test_features: experiments/phgeofuse_redesign_20260914/esm2_masked/features_test.npz
+
+model:
+  saprot_model: westlake-repl/SaProt_650M_AF2
+  saprot_revision: d9b9ad00ef61c0990e611b2b43f2231c7de24b38
+  embedding_dim: 1280
+
+lite:
+  design: P+R
+  alphas: [0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0]
+
+dual:
+  weight: 0.5
+  sequence_alpha: 0.2
+  seed: 42
+  bootstrap_draws: 2000
+  residual:
+    max_leaf_nodes: 7
+    max_iter: 50
+    min_samples_leaf: 80
+    l2_regularization: 30
+    learning_rate: 0.05
+    early_stopping: false
+
+retrieval:
+  top_k: 5
+  candidate_k: 64
+  search_sensitivity: 7.5
+  search_threads: 8
+  require_mmseqs: true
+  require_foldseek: true
+  mmseqs_binary: mmseqs
+
+structure:
+  foldseek_binary: foldseek
+
+runtime:
+  offline: true

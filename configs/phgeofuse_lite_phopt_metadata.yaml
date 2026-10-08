@@ -1,0 +1,29 @@
+# Optional metadata variant, with separate outputs from the default P+R model.
+paths:
+  manifest: experiments/dual_phoptnn_20260924/manifest.csv
+  retrieval: experiments/dual_phoptnn_20260924/retrieval.pt
+  lite_run: artifacts/phgeofuse_lite/prm_v1
+
+model:
+  saprot_model: westlake-repl/SaProt_650M_AF2
+  saprot_revision: d9b9ad00ef61c0990e611b2b43f2231c7de24b38
+  embedding_dim: 1280
+
+lite:
+  design: P+R+M
+  alphas: [0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0]
+
+retrieval:
+  top_k: 5
+  candidate_k: 64
+  search_sensitivity: 7.5
+  search_threads: 8
+  require_mmseqs: true
+  require_foldseek: true
+  mmseqs_binary: mmseqs
+
+structure:
+  foldseek_binary: foldseek
+
+runtime:
+  offline: true
